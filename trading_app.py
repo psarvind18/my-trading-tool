@@ -39,7 +39,6 @@ def xirr(transactions):
         total_npv = 0.0
         for dt, amt in transactions:
             days = (dt - start_date).days
-            # Avoid division by zero or complex numbers with negative rates
             if rate <= -1.0: rate = -0.9999
             total_npv += amt / ((1 + rate) ** (days / 365.0))
         return total_npv
@@ -69,6 +68,34 @@ def xirr(transactions):
 # --- Main App ---
 st.title("🛠️ Fully Customizable Trading Backtester")
 
+# --- STRATEGY EXPLANATION DROPDOWN ---
+with st.expander("📘 Strategy Explanation (Click to Expand)"):
+    st.markdown("""
+    ### 1. The "Buy the Dip" Logic
+    This strategy attempts to buy shares whenever the price drops significantly below the previous day's closing price. It uses a "tiered" approach, meaning it buys more as the price drops further.
+    
+    * **Scenario:** Imagine the stock closed yesterday at **$100**.
+    * **Setting:** Your 'Buy Drop Step' is **1%**.
+    * **What happens:** The algorithm places buy orders at:
+        * **$99.00** (-1% drop)
+        * **$98.00** (-2% drop)
+        * **$97.00** (-3% drop)
+    * If the price today drops to **$97.50**, the system executes the first two buys ($99 and $98).
+
+    ### 2. The "Take Profit" Logic
+    Each batch of shares you buy is treated as an independent trade. We don't wait for your *average* cost to break even; we hold each share until it specifically hits its profit target.
+    
+    * **Scenario:** You bought a share at **$98.00**.
+    * **Setting:** Your 'Sell Profit Target' is **4%**.
+    * **Target:** The system waits for the price to rise to **$101.92** ($98 + 4%).
+    * **Result:** As soon as the market price hits that target on any future day, that specific share is sold, and the cash (plus profit) returns to your wallet.
+
+    ### 3. The Wallet Rule
+    * You start with a fixed **Initial Investment**.
+    * If a buying opportunity occurs (e.g., price drops 5%), but your wallet is empty because you are holding too many stocks, that trade is marked as **MISSED** (Red).
+    * This helps you see if your budget is large enough to handle the strategy.
+    """)
+
 # --- Sidebar ---
 with st.sidebar:
     st.header("1. Market Data")
@@ -83,7 +110,6 @@ with st.sidebar:
     
     st.header("2. Strategy Settings")
     
-    # New Inputs for Buy/Sell Logic
     buy_drop_pct = st.number_input(
         "Buy Drop Step (%)", 
         min_value=0.1, 
@@ -112,13 +138,6 @@ with st.sidebar:
 if run_btn or 'data_loaded' in st.session_state:
     st.session_state['data_loaded'] = True
     
-    # Display Strategy Summary
-    st.markdown(f"""
-    **Current Strategy:**
-    * **Buy:** Every **{buy_drop_pct}%** drop from Previous Close.
-    * **Sell:** At **{sell_profit_pct}%** profit per position.
-    """)
-    
     with st.spinner(f'Analyzing {ticker_symbol}...'):
         df = load_stock_data(ticker_symbol, start_input, end_input)
 
@@ -134,13 +153,11 @@ if run_btn or 'data_loaded' in st.session_state:
             
             drop_level = 1
             while True:
-                # DYNAMIC CALCULATION: drop_step * level
                 current_drop_pct = buy_drop_pct * drop_level
                 target_buy_price = prev_close * (1 - (current_drop_pct / 100.0))
                 
                 if daily_low <= target_buy_price:
                     buy_price = target_buy_price
-                    # DYNAMIC CALCULATION: sell target
                     target_sell_price = buy_price * (1 + (sell_profit_pct / 100.0))
                     
                     sell_date = pd.NaT
