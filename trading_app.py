@@ -21,8 +21,7 @@ def load_stock_data(ticker, start_date, end_date):
 
 def xirr(transactions):
     """
-    Calculates XIRR (Extended Internal Rate of Return).
-    transactions: list of tuples [(date, amount), ...]
+    Calculates XIRR (Extended Internal Rate of Return) for trade efficiency.
     """
     if not transactions:
         return 0.0
@@ -30,7 +29,6 @@ def xirr(transactions):
     transactions.sort(key=lambda x: x[0])
     start_date = transactions[0][0]
     
-    # Check if we have both positive and negative cash flows
     amounts = [t[1] for t in transactions]
     if all(a >= 0 for a in amounts) or all(a <= 0 for a in amounts):
         return 0.0
@@ -72,28 +70,16 @@ st.title("🛠️ Fully Customizable Trading Backtester")
 with st.expander("📘 Strategy Explanation (Click to Expand)"):
     st.markdown("""
     ### 1. The "Buy the Dip" Logic
-    This strategy attempts to buy shares whenever the price drops significantly below the previous day's closing price. It uses a "tiered" approach, meaning it buys more as the price drops further.
+    This strategy attempts to buy shares whenever the price drops significantly below the previous day's closing price. It uses a "tiered" approach.
+    * **Scenario:** Closing Price yesterday was $100. Buy Drop Step is 1%.
+    * **Orders:** It places buy orders at $99 (-1%), $98 (-2%), etc.
     
-    * **Scenario:** Imagine the stock closed yesterday at **$100**.
-    * **Setting:** Your 'Buy Drop Step' is **1%**.
-    * **What happens:** The algorithm places buy orders at:
-        * **$99.00** (-1% drop)
-        * **$98.00** (-2% drop)
-        * **$97.00** (-3% drop)
-    * If the price today drops to **$97.50**, the system executes the first two buys ($99 and $98).
-
     ### 2. The "Take Profit" Logic
-    Each batch of shares you buy is treated as an independent trade. We don't wait for your *average* cost to break even; we hold each share until it specifically hits its profit target.
+    Each batch of shares is held until it hits a specific profit target (e.g., 4% above purchase price).
     
-    * **Scenario:** You bought a share at **$98.00**.
-    * **Setting:** Your 'Sell Profit Target' is **4%**.
-    * **Target:** The system waits for the price to rise to **$101.92** ($98 + 4%).
-    * **Result:** As soon as the market price hits that target on any future day, that specific share is sold, and the cash (plus profit) returns to your wallet.
-
-    ### 3. The Wallet Rule
-    * You start with a fixed **Initial Investment**.
-    * If a buying opportunity occurs (e.g., price drops 5%), but your wallet is empty because you are holding too many stocks, that trade is marked as **MISSED** (Red).
-    * This helps you see if your budget is large enough to handle the strategy.
+    ### 3. Interest on Idle Cash
+    * Any money sitting in your wallet (not invested in stocks) earns daily interest at the specified **Cash Interest Rate**. 
+    * This simulates holding your uninvested funds in a high-yield savings account or a brokerage sweep account.
     """)
 
 # --- Sidebar ---
@@ -124,6 +110,14 @@ with st.sidebar:
         value=4.0, 
         step=0.1,
         help="Sell when price reaches X% above buy price."
+    )
+    
+    interest_rate_pct = st.number_input(
+        "Cash Interest Rate (%)",
+        min_value=0.0,
+        value=4.5,
+        step=0.1,
+        help="Annual interest rate earned on uninvested cash in the wallet."
     )
     
     st.divider()
@@ -184,7 +178,7 @@ if run_btn or 'data_loaded' in st.session_state:
                 else:
                     break
         
-        # --- 2. Wallet Simulation ---
+        # --- 2. Wallet Simulation (With Interest) ---
         events = []
         for t in potential_trades:
             cost = t['buy_price'] * shares_per_trade
@@ -204,7 +198,24 @@ if run_btn or 'data_loaded' in st.session_state:
         executed_count = 0
         missed_count = 0
         
+        total_interest_earned = 0.0
+        
+        # Start tracking interest from the very first day of data
+        last_date = df.iloc[0]['Date']
+        
         for event in events:
+            # 1. Accrue Interest since last event
+            days_passed = (event['date'] - last_date).days
+            if days_passed > 0 and wallet > 0:
+                # Simple daily interest formula
+                interest = wallet * (interest_rate_pct / 100.0) * (days_passed / 365.0)
+                wallet += interest
+                total_interest_earned += interest
+            
+            # Update date tracker
+            last_date = event['date']
+            
+            # 2. Process Trade Event
             tid = event['trade_id']
             if event['type'] == 'buy':
                 if wallet >= event['amount']:
@@ -222,10 +233,17 @@ if run_btn or 'data_loaded' in st.session_state:
                     active_holdings.remove(tid)
                     trade_cash_flows.append((event['date'], event['amount']))
 
+        # 3. Accrue Interest for remaining days after last event until end of data
+        final_date = df.iloc[-1]['Date']
+        days_remaining = (final_date - last_date).days
+        if days_remaining > 0 and wallet > 0:
+            interest = wallet * (interest_rate_pct / 100.0) * (days_remaining / 365.0)
+            wallet += interest
+            total_interest_earned += interest
+
         # --- 3. Final Valuation ---
         last_close_price = df.iloc[-1]['Close']
         open_position_value = 0
-        final_date = df.iloc[-1]['Date']
         
         for t in potential_trades:
             if trade_decisions.get(t['trade_id']) == "Executed" and t['status'] == "Open":
@@ -235,32 +253,44 @@ if run_btn or 'data_loaded' in st.session_state:
 
         final_portfolio_value = wallet + open_position_value
         
-        # --- 4. Metrics ---
+        # --- 4. Metrics & Buy/Hold Comparison ---
+        
+        # A. Buy and Hold Calculation
+        start_price = df.iloc[0]['Close']
+        end_price = df.iloc[-1]['Close']
+        
+        bh_shares = int(initial_investment // start_price)
+        bh_residual_cash = initial_investment - (bh_shares * start_price)
+        # Assuming residual cash also earns interest? Usually negligible, but let's leave it simple.
+        bh_final_value = (bh_shares * end_price) + bh_residual_cash
+        bh_return_pct = (bh_final_value - initial_investment) / initial_investment
+
+        # B. Strategy CAGR
         total_days = (end_input - start_input).days
         years = total_days / 365.25
         cagr = 0.0
         if years > 0 and initial_investment > 0:
             cagr = (final_portfolio_value / initial_investment) ** (1 / years) - 1
             
-        portfolio_flows = [
-            (pd.Timestamp(start_input), -initial_investment),
-            (pd.Timestamp(end_input), final_portfolio_value)
-        ]
-        portfolio_irr = xirr(portfolio_flows)
+        # C. Trade XIRR
         trade_irr = xirr(trade_cash_flows)
 
         # --- Dashboard ---
         st.markdown("### 📊 Performance Metrics")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Final Value", f"{currency_symbol}{final_portfolio_value:,.2f}", 
+        c1.metric("Final Wallet Value", f"{currency_symbol}{final_portfolio_value:,.2f}", 
                   delta=f"{currency_symbol}{final_portfolio_value - initial_investment:,.2f}")
-        c2.metric("CAGR", f"{cagr:.2%}")
-        c3.metric("Portfolio IRR", f"{portfolio_irr:.2%}")
-        c4.metric("Trade XIRR", f"{trade_irr:.2%}")
+        c2.metric("Strategy CAGR", f"{cagr:.2%}")
+        
+        c3.metric("Buy & Hold Return", f"{currency_symbol}{bh_final_value:,.2f}", 
+                  delta=f"{bh_return_pct:.2%}",
+                  help="Benchmark: Buying full shares on Day 1.")
+                  
+        c4.metric("Trade XIRR", f"{trade_irr:.2%}", help="Return efficiency of active capital (excludes cash interest).")
 
         c5, c6, c7, c8 = st.columns(4)
         c5.metric("Executed Trades", executed_count)
-        c6.metric("Missed Trades", missed_count, delta_color="inverse")
+        c6.metric("Total Interest Earned", f"{currency_symbol}{total_interest_earned:,.2f}")
         c7.metric("Cash Balance", f"{currency_symbol}{wallet:,.2f}")
         c8.metric("Open Pos Value", f"{currency_symbol}{open_position_value:,.2f}")
         
