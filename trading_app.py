@@ -198,4 +198,96 @@ if run_btn or 'data_loaded' in st.session_state:
                     trade_cash_flows.append((event['date'], -event['amount']))
                 else:
                     trade_decisions[tid] = "Missed"
-                    missed_
+                    missed_count += 1
+            elif event['type'] == 'sell':
+                if tid in active_holdings:
+                    wallet += event['amount']
+                    active_holdings.remove(tid)
+                    trade_cash_flows.append((event['date'], event['amount']))
+
+        # --- 3. Final Valuation ---
+        last_close_price = df.iloc[-1]['Close']
+        open_position_value = 0
+        final_date = df.iloc[-1]['Date']
+        
+        for t in potential_trades:
+            if trade_decisions.get(t['trade_id']) == "Executed" and t['status'] == "Open":
+                current_val = last_close_price * shares_per_trade
+                open_position_value += current_val
+                trade_cash_flows.append((final_date, current_val))
+
+        final_portfolio_value = wallet + open_position_value
+        
+        # --- 4. Metrics ---
+        total_days = (end_input - start_input).days
+        years = total_days / 365.25
+        cagr = 0.0
+        if years > 0 and initial_investment > 0:
+            cagr = (final_portfolio_value / initial_investment) ** (1 / years) - 1
+            
+        portfolio_flows = [
+            (pd.Timestamp(start_input), -initial_investment),
+            (pd.Timestamp(end_input), final_portfolio_value)
+        ]
+        portfolio_irr = xirr(portfolio_flows)
+        trade_irr = xirr(trade_cash_flows)
+
+        # --- Dashboard ---
+        st.markdown("### 📊 Performance Metrics")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Final Value", f"{currency_symbol}{final_portfolio_value:,.2f}", 
+                  delta=f"{currency_symbol}{final_portfolio_value - initial_investment:,.2f}")
+        c2.metric("CAGR", f"{cagr:.2%}")
+        c3.metric("Portfolio IRR", f"{portfolio_irr:.2%}")
+        c4.metric("Trade XIRR", f"{trade_irr:.2%}")
+
+        c5, c6, c7, c8 = st.columns(4)
+        c5.metric("Executed Trades", executed_count)
+        c6.metric("Missed Trades", missed_count, delta_color="inverse")
+        c7.metric("Cash Balance", f"{currency_symbol}{wallet:,.2f}")
+        c8.metric("Open Pos Value", f"{currency_symbol}{open_position_value:,.2f}")
+        
+        st.markdown("### 📝 Detailed Trade Log")
+        final_log = []
+        for t in potential_trades:
+            decision = trade_decisions.get(t['trade_id'], "Missed")
+            profit = 0.0
+            sell_price_disp = 0.0
+            
+            if decision == "Executed":
+                if t['status'] == "Closed":
+                    profit = (t['sell_price'] - t['buy_price']) * shares_per_trade
+                    sell_price_disp = t['sell_price']
+                else:
+                    profit = (last_close_price - t['buy_price']) * shares_per_trade
+                    sell_price_disp = last_close_price
+            
+            final_log.append({
+                "Buy Date": t['buy_date'].strftime('%Y-%m-%d'),
+                "Drop %": t['drop_pct'],
+                "Buy Price": t['buy_price'],
+                "Sell Date": t['sell_date'].strftime('%Y-%m-%d') if pd.notnull(t['sell_date']) else "Open",
+                "Sell Price": sell_price_disp if decision == "Executed" else 0,
+                "Status": t['status'],
+                "Profit": profit if decision == "Executed" else 0.0,
+                "Execution": decision
+            })
+            
+        results_df = pd.DataFrame(final_log)
+        
+        def style_rows(row):
+            if row['Execution'] == 'Missed':
+                return ['background-color: #ffebee; color: #c62828'] * len(row)
+            elif row['Status'] == 'Open':
+                return ['background-color: #e3f2fd; color: #0d47a1'] * len(row)
+            else:
+                return ['background-color: #e8f5e9; color: #1b5e20'] * len(row)
+        
+        fmt_df = results_df.copy()
+        fmt_df['Buy Price'] = fmt_df['Buy Price'].map(lambda x: f"{currency_symbol}{x:,.2f}")
+        fmt_df['Sell Price'] = fmt_df['Sell Price'].apply(lambda x: f"{currency_symbol}{x:,.2f}" if x > 0 else "-")
+        fmt_df['Profit'] = fmt_df['Profit'].map(lambda x: f"{currency_symbol}{x:,.2f}")
+        
+        st.dataframe(fmt_df.style.apply(style_rows, axis=1), use_container_width=True)
+else:
+    st.info("👈 Enter settings and click **Run Backtest**.")
