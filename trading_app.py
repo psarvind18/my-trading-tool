@@ -4,7 +4,7 @@ import yfinance as yf
 from datetime import date, timedelta
 
 # --- Configuration ---
-st.set_page_config(page_title="Customizable Dividend Backtester", layout="wide")
+st.set_page_config(page_title="Multi-Strategy Backtester", layout="wide")
 
 # --- Helper Functions ---
 @st.cache_data
@@ -67,22 +67,22 @@ def xirr(transactions):
     return rate
 
 # --- Main App ---
-st.title("🛡️ Customizable Dividend Backtester")
-
-with st.expander("📘 Strategy & Dividend Logic (Click to Expand)"):
-    st.markdown("""
-    ### 1. Strategy Logic
-    * **Buy:** Tiered buys on drops (e.g., -1%, -2%...).
-    * **Sell:** Exits at fixed profit target (e.g., +4%).
-    
-    ### 2. Dividend Controls
-    * **Include Dividends:** If enabled, historical dividends are fetched and added to the wallet for held shares.
-    * **Restrict Trading:** If enabled, the system **blocks** trades on the Ex-Date (+/- 1 day) to avoid volatility or tax complications.
-    """)
+st.title("🛡️ Multi-Strategy Backtester")
 
 # --- Sidebar ---
 with st.sidebar:
-    st.header("1. Market Data")
+    st.header("1. Strategy Selection")
+    
+    # STRATEGY SELECTOR
+    strategy_mode = st.radio(
+        "Choose Strategy Type:",
+        ("Swing Trading", "Dip Accumulation"),
+        help="Swing: Buy Dip & Sell High. \nAccumulation: Buy Dip & Hold Forever."
+    )
+    
+    st.divider()
+    
+    st.header("2. Market Data")
     ticker_symbol = st.text_input("Ticker Symbol", value="VOO").upper()
     currency_symbol = st.text_input("Currency Symbol", value="$")
     
@@ -92,18 +92,22 @@ with st.sidebar:
     
     st.divider()
     
-    st.header("2. Strategy Settings")
+    st.header("3. Trade Settings")
     buy_drop_pct = st.number_input("Buy Drop Step (%)", min_value=0.1, value=1.0, step=0.1)
-    sell_profit_pct = st.number_input("Sell Profit Target (%)", min_value=0.1, value=4.0, step=0.1)
+    
+    # Conditional Input: Sell Target only for Swing Trading
+    if strategy_mode == "Swing Trading":
+        sell_profit_pct = st.number_input("Sell Profit Target (%)", min_value=0.1, value=4.0, step=0.1)
+    else:
+        sell_profit_pct = 0.0 # Not used in Accumulation
+        st.info("ℹ️ Selling is disabled in Accumulation mode.")
     
     st.divider()
     
-    st.header("3. Dividend & Yield Settings")
+    st.header("4. Dividend & Yield")
     interest_rate_pct = st.number_input("Cash Interest Rate (%)", min_value=0.0, value=4.5, step=0.1)
     
-    # --- NEW TOGGLES ---
     enable_dividends = st.checkbox("Include Dividends", value=True)
-    
     if enable_dividends:
         restrict_ex_date = st.checkbox(
             "Restrict Trade around Ex-Date", 
@@ -112,15 +116,32 @@ with st.sidebar:
         )
     else:
         restrict_ex_date = False
-    # -------------------
     
     st.divider()
     
-    st.header("4. Wallet Settings")
+    st.header("5. Wallet Settings")
     initial_investment = st.number_input(f"Initial Investment ({currency_symbol})", value=10000.0, step=500.0)
     shares_per_trade = st.number_input("Shares per Trade", min_value=1, value=1, step=1)
     
     run_btn = st.button("Run Backtest")
+
+# --- Logic Explanation ---
+with st.expander(f"📘 Current Strategy Logic: {strategy_mode} (Click to Expand)"):
+    if strategy_mode == "Swing Trading":
+        st.markdown("""
+        **Objective:** Capture short-term volatility.
+        1. **Buy:** When price drops X% from previous close.
+        2. **Sell:** When that specific position reaches Y% profit.
+        3. **Cash:** Recycled back into the wallet after selling.
+        """)
+    else:
+        st.markdown("""
+        **Objective:** Accumulate shares at discount prices.
+        1. **Buy:** When price drops X% from previous close.
+        2. **Sell:** **NEVER.** Shares are held until the end of the simulation.
+        3. **Cash:** Only decreases. Once wallet is empty, no more dips can be bought.
+        """)
+    st.markdown("**Benchmark:** compared against 'Buy & Hold' (investing 100% lump sum on Day 1).")
 
 # --- Execution ---
 if run_btn or 'data_loaded' in st.session_state:
@@ -136,7 +157,6 @@ if run_btn or 'data_loaded' in st.session_state:
         restricted_indices = set()
         dividend_events = []
         
-        # Only process dividend restrictions if BOTH toggles are ON
         if enable_dividends:
             div_indices = df.index[df['Dividends'] > 0].tolist()
             for idx in div_indices:
@@ -146,7 +166,7 @@ if run_btn or 'data_loaded' in st.session_state:
                 })
                 
                 if restrict_ex_date:
-                    restricted_indices.add(idx)       # Ex-Date
+                    restricted_indices.add(idx)
                     if idx > 0: restricted_indices.add(idx - 1)
                     if idx < len(df) - 1: restricted_indices.add(idx + 1)
 
@@ -159,7 +179,6 @@ if run_btn or 'data_loaded' in st.session_state:
             if daily_date not in trades_by_date:
                 trades_by_date[daily_date] = {'buys': [], 'sells': []}
             
-            # Check Restriction
             if i in restricted_indices:
                 continue 
             
@@ -173,20 +192,27 @@ if run_btn or 'data_loaded' in st.session_state:
                 
                 if daily_low <= target_buy_price:
                     buy_price = target_buy_price
-                    target_sell_price = buy_price * (1 + (sell_profit_pct / 100.0))
                     
                     sell_date = pd.NaT
                     sell_price = 0.0
                     status = "Open"
                     
-                    for j in range(i + 1, len(df)):
-                        if j in restricted_indices: continue
-                            
-                        if df.loc[j, 'High'] >= target_sell_price:
-                            sell_date = df.loc[j, 'Date']
-                            sell_price = target_sell_price
-                            status = "Closed"
-                            break
+                    # --- EXIT LOGIC ---
+                    if strategy_mode == "Swing Trading":
+                        target_sell_price = buy_price * (1 + (sell_profit_pct / 100.0))
+                        
+                        for j in range(i + 1, len(df)):
+                            if j in restricted_indices: continue
+                                
+                            if df.loc[j, 'High'] >= target_sell_price:
+                                sell_date = df.loc[j, 'Date']
+                                sell_price = target_sell_price
+                                status = "Closed"
+                                break
+                    else:
+                        # Dip Accumulation: Never Sell
+                        status = "Open"
+                        # No sell_date, No sell_price
                     
                     trade_obj = {
                         "trade_id": len(potential_trades),
@@ -233,7 +259,7 @@ if run_btn or 'data_loaded' in st.session_state:
                 wallet += interest
                 total_interest_earned += interest
             
-            # Dividend Collection (Only if Enabled)
+            # Dividend Collection
             if enable_dividends:
                 today_div_amount = df.loc[i, 'Dividends']
                 if today_div_amount > 0 and len(active_holdings) > 0:
@@ -246,7 +272,7 @@ if run_btn or 'data_loaded' in st.session_state:
             if curr_date in trades_by_date:
                 day_activity = trades_by_date[curr_date]
                 
-                # Sells
+                # Sells (Only happens in Swing Trading mode)
                 for t in day_activity['sells']:
                     if t['trade_id'] in active_holdings:
                         revenue = t['sell_price'] * shares_per_trade
@@ -275,6 +301,7 @@ if run_btn or 'data_loaded' in st.session_state:
         final_date = df.iloc[-1]['Date']
         
         for t in potential_trades:
+            # Value all open positions (in Accumulation mode, this is all executed trades)
             if trade_decisions.get(t['trade_id']) == "Executed" and t['status'] == "Open":
                 current_val = last_close_price * shares_per_trade
                 open_position_value += current_val
@@ -287,7 +314,6 @@ if run_btn or 'data_loaded' in st.session_state:
         bh_shares = int(initial_investment // start_price)
         bh_residual_cash = initial_investment - (bh_shares * start_price)
         
-        # Calculate B&H dividends only if enabled
         bh_total_dividends = 0.0
         if enable_dividends:
             total_hist_dividends_per_share = df['Dividends'].sum()
@@ -309,7 +335,7 @@ if run_btn or 'data_loaded' in st.session_state:
             curr_yield_display = f"{info['dividendYield']*100:.2f}%"
 
         # --- Dashboard ---
-        st.markdown(f"### 📊 Performance Summary (Yield: {curr_yield_display})")
+        st.markdown(f"### 📊 Performance: {strategy_mode} (Yield: {curr_yield_display})")
         
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Final Wallet Value", f"{currency_symbol}{final_portfolio_value:,.2f}", 
@@ -317,7 +343,7 @@ if run_btn or 'data_loaded' in st.session_state:
         c2.metric("Strategy CAGR", f"{cagr:.2%}")
         c3.metric("Buy & Hold Return", f"{currency_symbol}{bh_final_value:,.2f}", 
                   delta=f"{bh_return_pct:.2%}",
-                  help="Includes price appreciation + dividends (if enabled).")
+                  help="Benchmark: Invest 100% on Day 1.")
         c4.metric("Trade XIRR", f"{trade_irr:.2%}")
 
         c5, c6, c7, c8 = st.columns(4)
@@ -347,6 +373,7 @@ if run_btn or 'data_loaded' in st.session_state:
                     profit_per_share = t['sell_price'] - t['buy_price']
                     sell_price_disp = t['sell_price']
                 else:
+                    # Open position profit (unrealized)
                     profit_per_share = last_close_price - t['buy_price']
                     sell_price_disp = last_close_price
                 
