@@ -1,34 +1,37 @@
 import streamlit as st
 import pandas as pd
 import yfinance as yf
-from datetime import date
+from datetime import date, timedelta
 
 # --- Configuration ---
-st.set_page_config(page_title="Customizable Trading Backtest", layout="wide")
+st.set_page_config(page_title="Customizable Dividend Backtester", layout="wide")
 
 # --- Helper Functions ---
 @st.cache_data
-def load_stock_data(ticker, start_date, end_date):
+def load_stock_data(ticker_symbol, start_date, end_date):
+    """
+    Fetches OHLC data AND Dividend/Split events.
+    Uses auto_adjust=False to get actual market prices.
+    """
     try:
-        df = yf.download(ticker, start=start_date, end=end_date, auto_adjust=True, progress=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        ticker = yf.Ticker(ticker_symbol)
+        df = ticker.history(start=start_date, end=end_date, auto_adjust=False)
+        df.index = df.index.tz_localize(None)
         df.reset_index(inplace=True)
-        return df
+        
+        if 'Dividends' not in df.columns:
+            df['Dividends'] = 0.0
+            
+        return df, ticker.info
     except Exception as e:
         st.error(f"Error fetching data: {e}")
-        return pd.DataFrame()
+        return pd.DataFrame(), {}
 
 def xirr(transactions):
-    """
-    Calculates XIRR (Extended Internal Rate of Return) for trade efficiency.
-    """
     if not transactions:
         return 0.0
-    
     transactions.sort(key=lambda x: x[0])
     start_date = transactions[0][0]
-    
     amounts = [t[1] for t in transactions]
     if all(a >= 0 for a in amounts) or all(a <= 0 for a in amounts):
         return 0.0
@@ -64,29 +67,24 @@ def xirr(transactions):
     return rate
 
 # --- Main App ---
-st.title("🛠️ Fully Customizable Trading Backtester")
+st.title("🛡️ Customizable Dividend Backtester")
 
-# --- STRATEGY EXPLANATION DROPDOWN ---
-with st.expander("📘 Strategy Explanation (Click to Expand)"):
+with st.expander("📘 Strategy & Dividend Logic (Click to Expand)"):
     st.markdown("""
-    ### 1. The "Buy the Dip" Logic
-    This strategy attempts to buy shares whenever the price drops significantly below the previous day's closing price. It uses a "tiered" approach.
-    * **Scenario:** Closing Price yesterday was $100. Buy Drop Step is 1%.
-    * **Orders:** It places buy orders at $99 (-1%), $98 (-2%), etc.
+    ### 1. Strategy Logic
+    * **Buy:** Tiered buys on drops (e.g., -1%, -2%...).
+    * **Sell:** Exits at fixed profit target (e.g., +4%).
     
-    ### 2. The "Take Profit" Logic
-    Each batch of shares is held until it hits a specific profit target (e.g., 4% above purchase price).
-    
-    ### 3. Interest on Idle Cash
-    * Any money sitting in your wallet (not invested in stocks) earns daily interest at the specified **Cash Interest Rate**. 
-    * This simulates holding your uninvested funds in a high-yield savings account or a brokerage sweep account.
+    ### 2. Dividend Controls
+    * **Include Dividends:** If enabled, historical dividends are fetched and added to the wallet for held shares.
+    * **Restrict Trading:** If enabled, the system **blocks** trades on the Ex-Date (+/- 1 day) to avoid volatility or tax complications.
     """)
 
 # --- Sidebar ---
 with st.sidebar:
     st.header("1. Market Data")
-    ticker_symbol = st.text_input("Ticker Symbol", value="NIFTYBEES.NS").upper()
-    currency_symbol = st.text_input("Currency Symbol", value="₹")
+    ticker_symbol = st.text_input("Ticker Symbol", value="VOO").upper()
+    currency_symbol = st.text_input("Currency Symbol", value="$")
     
     today = date.today()
     start_input = st.date_input("Start Date", value=date(today.year - 1, 1, 1))
@@ -95,36 +93,32 @@ with st.sidebar:
     st.divider()
     
     st.header("2. Strategy Settings")
-    
-    buy_drop_pct = st.number_input(
-        "Buy Drop Step (%)", 
-        min_value=0.1, 
-        value=1.0, 
-        step=0.1,
-        help="Buy at every X% drop (e.g., 1% means buy at -1%, -2%, -3%...)"
-    )
-    
-    sell_profit_pct = st.number_input(
-        "Sell Profit Target (%)", 
-        min_value=0.1, 
-        value=4.0, 
-        step=0.1,
-        help="Sell when price reaches X% above buy price."
-    )
-    
-    interest_rate_pct = st.number_input(
-        "Cash Interest Rate (%)",
-        min_value=0.0,
-        value=4.5,
-        step=0.1,
-        help="Annual interest rate earned on uninvested cash in the wallet."
-    )
+    buy_drop_pct = st.number_input("Buy Drop Step (%)", min_value=0.1, value=1.0, step=0.1)
+    sell_profit_pct = st.number_input("Sell Profit Target (%)", min_value=0.1, value=4.0, step=0.1)
     
     st.divider()
     
-    st.header("3. Wallet Settings")
-    initial_investment = st.number_input(f"Initial Investment ({currency_symbol})", value=100000.0, step=500.0)
-    shares_per_trade = st.number_input("Shares per Trade", min_value=1, value=10, step=1)
+    st.header("3. Dividend & Yield Settings")
+    interest_rate_pct = st.number_input("Cash Interest Rate (%)", min_value=0.0, value=4.5, step=0.1)
+    
+    # --- NEW TOGGLES ---
+    enable_dividends = st.checkbox("Include Dividends", value=True)
+    
+    if enable_dividends:
+        restrict_ex_date = st.checkbox(
+            "Restrict Trade around Ex-Date", 
+            value=True, 
+            help="If checked, prevents Buys/Sells on Ex-Date, Day Before, and Day After."
+        )
+    else:
+        restrict_ex_date = False
+    # -------------------
+    
+    st.divider()
+    
+    st.header("4. Wallet Settings")
+    initial_investment = st.number_input(f"Initial Investment ({currency_symbol})", value=10000.0, step=500.0)
+    shares_per_trade = st.number_input("Shares per Trade", min_value=1, value=1, step=1)
     
     run_btn = st.button("Run Backtest")
 
@@ -132,18 +126,45 @@ with st.sidebar:
 if run_btn or 'data_loaded' in st.session_state:
     st.session_state['data_loaded'] = True
     
-    with st.spinner(f'Analyzing {ticker_symbol}...'):
-        df = load_stock_data(ticker_symbol, start_input, end_input)
+    with st.spinner(f'Fetching data for {ticker_symbol}...'):
+        df, info = load_stock_data(ticker_symbol, start_input, end_input)
 
-    if df.empty or len(df) < 2:
+    if df.empty or len(df) < 5:
         st.error("No sufficient data found.")
     else:
+        # --- Pre-Calculation: Restricted Days ---
+        restricted_indices = set()
+        dividend_events = []
+        
+        # Only process dividend restrictions if BOTH toggles are ON
+        if enable_dividends:
+            div_indices = df.index[df['Dividends'] > 0].tolist()
+            for idx in div_indices:
+                dividend_events.append({
+                    "Date": df.loc[idx, 'Date'],
+                    "Amount": df.loc[idx, 'Dividends']
+                })
+                
+                if restrict_ex_date:
+                    restricted_indices.add(idx)       # Ex-Date
+                    if idx > 0: restricted_indices.add(idx - 1)
+                    if idx < len(df) - 1: restricted_indices.add(idx + 1)
+
         # --- 1. Signal Generation ---
         potential_trades = []
+        trades_by_date = {} 
+        
         for i in range(1, len(df)):
+            daily_date = df.loc[i, 'Date']
+            if daily_date not in trades_by_date:
+                trades_by_date[daily_date] = {'buys': [], 'sells': []}
+            
+            # Check Restriction
+            if i in restricted_indices:
+                continue 
+            
             prev_close = df.loc[i-1, 'Close']
             daily_low = df.loc[i, 'Low']
-            daily_date = df.loc[i, 'Date']
             
             drop_level = 1
             while True:
@@ -159,13 +180,15 @@ if run_btn or 'data_loaded' in st.session_state:
                     status = "Open"
                     
                     for j in range(i + 1, len(df)):
+                        if j in restricted_indices: continue
+                            
                         if df.loc[j, 'High'] >= target_sell_price:
                             sell_date = df.loc[j, 'Date']
                             sell_price = target_sell_price
                             status = "Closed"
                             break
                     
-                    potential_trades.append({
+                    trade_obj = {
                         "trade_id": len(potential_trades),
                         "buy_date": daily_date,
                         "buy_price": buy_price,
@@ -173,77 +196,83 @@ if run_btn or 'data_loaded' in st.session_state:
                         "sell_date": sell_date,
                         "sell_price": sell_price,
                         "status": status
-                    })
+                    }
+                    potential_trades.append(trade_obj)
+                    trades_by_date[daily_date]['buys'].append(trade_obj)
+                    
+                    if status == "Closed":
+                        if sell_date not in trades_by_date:
+                            trades_by_date[sell_date] = {'buys': [], 'sells': []}
+                        trades_by_date[sell_date]['sells'].append(trade_obj)
+                        
                     drop_level += 1
                 else:
                     break
         
-        # --- 2. Wallet Simulation (With Interest) ---
-        events = []
-        for t in potential_trades:
-            cost = t['buy_price'] * shares_per_trade
-            revenue = t['sell_price'] * shares_per_trade
-            events.append({"date": t['buy_date'], "type": "buy", "trade_id": t['trade_id'], "amount": cost})
-            if t['status'] == "Closed":
-                events.append({"date": t['sell_date'], "type": "sell", "trade_id": t['trade_id'], "amount": revenue})
-        
-        type_priority = {'sell': 0, 'buy': 1}
-        events.sort(key=lambda x: (x['date'], type_priority[x['type']]))
-        
+        # --- 2. Simulation ---
         wallet = initial_investment
-        active_holdings = set() 
+        active_holdings = set()
         trade_decisions = {}
         trade_cash_flows = []
+        
+        total_interest_earned = 0.0
+        total_dividends_earned = 0.0
         
         executed_count = 0
         missed_count = 0
         
-        total_interest_earned = 0.0
+        prev_sim_date = df.iloc[0]['Date']
         
-        # Start tracking interest from the very first day of data
-        last_date = df.iloc[0]['Date']
-        
-        for event in events:
-            # 1. Accrue Interest since last event
-            days_passed = (event['date'] - last_date).days
-            if days_passed > 0 and wallet > 0:
-                # Simple daily interest formula
-                interest = wallet * (interest_rate_pct / 100.0) * (days_passed / 365.0)
+        for i in range(len(df)):
+            curr_date = df.iloc[i]['Date']
+            
+            # Interest Calculation
+            days_delta = (curr_date - prev_sim_date).days
+            if days_delta > 0 and wallet > 0:
+                interest = wallet * (interest_rate_pct / 100.0 / 365.0) * days_delta
                 wallet += interest
                 total_interest_earned += interest
             
-            # Update date tracker
-            last_date = event['date']
+            # Dividend Collection (Only if Enabled)
+            if enable_dividends:
+                today_div_amount = df.loc[i, 'Dividends']
+                if today_div_amount > 0 and len(active_holdings) > 0:
+                    total_shares_held = len(active_holdings) * shares_per_trade
+                    payout = total_shares_held * today_div_amount
+                    wallet += payout
+                    total_dividends_earned += payout
+
+            # Trade Processing
+            if curr_date in trades_by_date:
+                day_activity = trades_by_date[curr_date]
+                
+                # Sells
+                for t in day_activity['sells']:
+                    if t['trade_id'] in active_holdings:
+                        revenue = t['sell_price'] * shares_per_trade
+                        wallet += revenue
+                        active_holdings.remove(t['trade_id'])
+                        trade_cash_flows.append((curr_date, revenue))
+                
+                # Buys
+                for t in day_activity['buys']:
+                    cost = t['buy_price'] * shares_per_trade
+                    if wallet >= cost:
+                        wallet -= cost
+                        active_holdings.add(t['trade_id'])
+                        trade_decisions[t['trade_id']] = "Executed"
+                        executed_count += 1
+                        trade_cash_flows.append((curr_date, -cost))
+                    else:
+                        trade_decisions[t['trade_id']] = "Missed"
+                        missed_count += 1
             
-            # 2. Process Trade Event
-            tid = event['trade_id']
-            if event['type'] == 'buy':
-                if wallet >= event['amount']:
-                    wallet -= event['amount']
-                    active_holdings.add(tid)
-                    trade_decisions[tid] = "Executed"
-                    executed_count += 1
-                    trade_cash_flows.append((event['date'], -event['amount']))
-                else:
-                    trade_decisions[tid] = "Missed"
-                    missed_count += 1
-            elif event['type'] == 'sell':
-                if tid in active_holdings:
-                    wallet += event['amount']
-                    active_holdings.remove(tid)
-                    trade_cash_flows.append((event['date'], event['amount']))
+            prev_sim_date = curr_date
 
-        # 3. Accrue Interest for remaining days after last event until end of data
-        final_date = df.iloc[-1]['Date']
-        days_remaining = (final_date - last_date).days
-        if days_remaining > 0 and wallet > 0:
-            interest = wallet * (interest_rate_pct / 100.0) * (days_remaining / 365.0)
-            wallet += interest
-            total_interest_earned += interest
-
-        # --- 3. Final Valuation ---
+        # --- 3. Valuation ---
         last_close_price = df.iloc[-1]['Close']
         open_position_value = 0
+        final_date = df.iloc[-1]['Date']
         
         for t in potential_trades:
             if trade_decisions.get(t['trade_id']) == "Executed" and t['status'] == "Open":
@@ -253,61 +282,75 @@ if run_btn or 'data_loaded' in st.session_state:
 
         final_portfolio_value = wallet + open_position_value
         
-        # --- 4. Metrics & Buy/Hold Comparison ---
-        
-        # A. Buy and Hold Calculation
+        # --- 4. Metrics ---
         start_price = df.iloc[0]['Close']
-        end_price = df.iloc[-1]['Close']
-        
         bh_shares = int(initial_investment // start_price)
         bh_residual_cash = initial_investment - (bh_shares * start_price)
-        # Assuming residual cash also earns interest? Usually negligible, but let's leave it simple.
-        bh_final_value = (bh_shares * end_price) + bh_residual_cash
+        
+        # Calculate B&H dividends only if enabled
+        bh_total_dividends = 0.0
+        if enable_dividends:
+            total_hist_dividends_per_share = df['Dividends'].sum()
+            bh_total_dividends = bh_shares * total_hist_dividends_per_share
+        
+        bh_final_value = (bh_shares * last_close_price) + bh_residual_cash + bh_total_dividends
         bh_return_pct = (bh_final_value - initial_investment) / initial_investment
 
-        # B. Strategy CAGR
         total_days = (end_input - start_input).days
         years = total_days / 365.25
         cagr = 0.0
         if years > 0 and initial_investment > 0:
             cagr = (final_portfolio_value / initial_investment) ** (1 / years) - 1
             
-        # C. Trade XIRR
         trade_irr = xirr(trade_cash_flows)
+        
+        curr_yield_display = "N/A"
+        if 'dividendYield' in info and info['dividendYield'] is not None:
+            curr_yield_display = f"{info['dividendYield']*100:.2f}%"
 
         # --- Dashboard ---
-        st.markdown("### 📊 Performance Metrics")
+        st.markdown(f"### 📊 Performance Summary (Yield: {curr_yield_display})")
+        
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Final Wallet Value", f"{currency_symbol}{final_portfolio_value:,.2f}", 
                   delta=f"{currency_symbol}{final_portfolio_value - initial_investment:,.2f}")
         c2.metric("Strategy CAGR", f"{cagr:.2%}")
-        
         c3.metric("Buy & Hold Return", f"{currency_symbol}{bh_final_value:,.2f}", 
                   delta=f"{bh_return_pct:.2%}",
-                  help="Benchmark: Buying full shares on Day 1.")
-                  
-        c4.metric("Trade XIRR", f"{trade_irr:.2%}", help="Return efficiency of active capital (excludes cash interest).")
+                  help="Includes price appreciation + dividends (if enabled).")
+        c4.metric("Trade XIRR", f"{trade_irr:.2%}")
 
         c5, c6, c7, c8 = st.columns(4)
         c5.metric("Executed Trades", executed_count)
-        c6.metric("Total Interest Earned", f"{currency_symbol}{total_interest_earned:,.2f}")
+        c6.metric("Total Passive Income", f"{currency_symbol}{total_interest_earned + total_dividends_earned:,.2f}",
+                  help=f"Interest: {currency_symbol}{total_interest_earned:,.0f} | Dividends: {currency_symbol}{total_dividends_earned:,.0f}")
         c7.metric("Cash Balance", f"{currency_symbol}{wallet:,.2f}")
         c8.metric("Open Pos Value", f"{currency_symbol}{open_position_value:,.2f}")
         
+        if enable_dividends and dividend_events:
+            with st.expander(f"📅 Dividend Schedule ({len(dividend_events)} payouts)"):
+                div_df = pd.DataFrame(dividend_events)
+                div_df['Date'] = div_df['Date'].dt.date
+                st.dataframe(div_df, use_container_width=True)
+
         st.markdown("### 📝 Detailed Trade Log")
+        
         final_log = []
         for t in potential_trades:
             decision = trade_decisions.get(t['trade_id'], "Missed")
-            profit = 0.0
+            profit_total = 0.0
+            profit_per_share = 0.0
             sell_price_disp = 0.0
             
             if decision == "Executed":
                 if t['status'] == "Closed":
-                    profit = (t['sell_price'] - t['buy_price']) * shares_per_trade
+                    profit_per_share = t['sell_price'] - t['buy_price']
                     sell_price_disp = t['sell_price']
                 else:
-                    profit = (last_close_price - t['buy_price']) * shares_per_trade
+                    profit_per_share = last_close_price - t['buy_price']
                     sell_price_disp = last_close_price
+                
+                profit_total = profit_per_share * shares_per_trade
             
             final_log.append({
                 "Buy Date": t['buy_date'].strftime('%Y-%m-%d'),
@@ -315,8 +358,9 @@ if run_btn or 'data_loaded' in st.session_state:
                 "Buy Price": t['buy_price'],
                 "Sell Date": t['sell_date'].strftime('%Y-%m-%d') if pd.notnull(t['sell_date']) else "Open",
                 "Sell Price": sell_price_disp if decision == "Executed" else 0,
+                "Profit/Share": profit_per_share if decision == "Executed" else 0.0,
+                "Total P&L": profit_total if decision == "Executed" else 0.0,
                 "Status": t['status'],
-                "Profit": profit if decision == "Executed" else 0.0,
                 "Execution": decision
             })
             
@@ -333,7 +377,8 @@ if run_btn or 'data_loaded' in st.session_state:
         fmt_df = results_df.copy()
         fmt_df['Buy Price'] = fmt_df['Buy Price'].map(lambda x: f"{currency_symbol}{x:,.2f}")
         fmt_df['Sell Price'] = fmt_df['Sell Price'].apply(lambda x: f"{currency_symbol}{x:,.2f}" if x > 0 else "-")
-        fmt_df['Profit'] = fmt_df['Profit'].map(lambda x: f"{currency_symbol}{x:,.2f}")
+        fmt_df['Profit/Share'] = fmt_df['Profit/Share'].map(lambda x: f"{currency_symbol}{x:,.2f}")
+        fmt_df['Total P&L'] = fmt_df['Total P&L'].map(lambda x: f"{currency_symbol}{x:,.2f}")
         
         st.dataframe(fmt_df.style.apply(style_rows, axis=1), use_container_width=True)
 else:
