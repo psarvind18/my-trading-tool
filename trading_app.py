@@ -4,7 +4,7 @@ import yfinance as yf
 from datetime import date, timedelta
 
 # --- Configuration ---
-st.set_page_config(page_title="Multi-Strategy Backtester", layout="wide")
+st.set_page_config(page_title="SIP Trading Backtester", layout="wide")
 
 # --- Helper Functions ---
 @st.cache_data
@@ -16,6 +16,7 @@ def load_stock_data(ticker_symbol, start_date, end_date):
     try:
         ticker = yf.Ticker(ticker_symbol)
         df = ticker.history(start=start_date, end=end_date, auto_adjust=False)
+        # Ensure timezone naive
         df.index = df.index.tz_localize(None)
         df.reset_index(inplace=True)
         
@@ -28,18 +29,28 @@ def load_stock_data(ticker_symbol, start_date, end_date):
         return pd.DataFrame(), {}
 
 def xirr(transactions):
+    """
+    Calculates XIRR (Extended Internal Rate of Return).
+    transactions: list of tuples [(date, amount)]
+    - Investments are NEGATIVE
+    - Final Value / Returns are POSITIVE
+    """
     if not transactions:
         return 0.0
     transactions.sort(key=lambda x: x[0])
-    start_date = transactions[0][0]
+    
+    # Validation: Must have at least one negative and one positive
     amounts = [t[1] for t in transactions]
     if all(a >= 0 for a in amounts) or all(a <= 0 for a in amounts):
         return 0.0
+        
+    start_date = transactions[0][0]
         
     def npv(rate):
         total_npv = 0.0
         for dt, amt in transactions:
             days = (dt - start_date).days
+            # Protect against division by zero or extreme rates
             if rate <= -1.0: rate = -0.9999
             total_npv += amt / ((1 + rate) ** (days / 365.0))
         return total_npv
@@ -67,13 +78,11 @@ def xirr(transactions):
     return rate
 
 # --- Main App ---
-st.title("🛡️ Multi-Strategy Backtester")
+st.title("🛡️ SIP & Trading Strategy Backtester")
 
 # --- Sidebar ---
 with st.sidebar:
     st.header("1. Strategy Selection")
-    
-    # STRATEGY SELECTOR
     strategy_mode = st.radio(
         "Choose Strategy Type:",
         ("Swing Trading", "Dip Accumulation"),
@@ -95,59 +104,37 @@ with st.sidebar:
     st.header("3. Trade Settings")
     buy_drop_pct = st.number_input("Buy Drop Step (%)", min_value=0.1, value=1.0, step=0.1)
     
-    # Conditional Input: Sell Target only for Swing Trading
     if strategy_mode == "Swing Trading":
         sell_profit_pct = st.number_input("Sell Profit Target (%)", min_value=0.1, value=4.0, step=0.1)
     else:
-        sell_profit_pct = 0.0 # Not used in Accumulation
-        st.info("ℹ️ Selling is disabled in Accumulation mode.")
+        sell_profit_pct = 0.0
+        st.info("Selling disabled in Accumulation mode.")
     
     st.divider()
     
-    st.header("4. Dividend & Yield")
+    st.header("4. Cash & Dividends")
     interest_rate_pct = st.number_input("Cash Interest Rate (%)", min_value=0.0, value=4.5, step=0.1)
     
     enable_dividends = st.checkbox("Include Dividends", value=True)
     if enable_dividends:
-        restrict_ex_date = st.checkbox(
-            "Restrict Trade around Ex-Date", 
-            value=True, 
-            help="If checked, prevents Buys/Sells on Ex-Date, Day Before, and Day After."
-        )
+        restrict_ex_date = st.checkbox("Restrict Trade around Ex-Date", value=True)
     else:
         restrict_ex_date = False
     
     st.divider()
     
-    st.header("5. Wallet Settings")
+    st.header("5. Investment Plan")
     initial_investment = st.number_input(f"Initial Investment ({currency_symbol})", value=10000.0, step=500.0)
+    monthly_investment = st.number_input(f"Monthly Contribution ({currency_symbol})", value=0.0, step=100.0, help="Added on the first trading day of each month.")
     shares_per_trade = st.number_input("Shares per Trade", min_value=1, value=1, step=1)
     
     run_btn = st.button("Run Backtest")
-
-# --- Logic Explanation ---
-with st.expander(f"📘 Current Strategy Logic: {strategy_mode} (Click to Expand)"):
-    if strategy_mode == "Swing Trading":
-        st.markdown("""
-        **Objective:** Capture short-term volatility.
-        1. **Buy:** When price drops X% from previous close.
-        2. **Sell:** When that specific position reaches Y% profit.
-        3. **Cash:** Recycled back into the wallet after selling.
-        """)
-    else:
-        st.markdown("""
-        **Objective:** Accumulate shares at discount prices.
-        1. **Buy:** When price drops X% from previous close.
-        2. **Sell:** **NEVER.** Shares are held until the end of the simulation.
-        3. **Cash:** Only decreases. Once wallet is empty, no more dips can be bought.
-        """)
-    st.markdown("**Benchmark:** compared against 'Buy & Hold' (investing 100% lump sum on Day 1).")
 
 # --- Execution ---
 if run_btn or 'data_loaded' in st.session_state:
     st.session_state['data_loaded'] = True
     
-    with st.spinner(f'Fetching data for {ticker_symbol}...'):
+    with st.spinner(f'Processing {ticker_symbol}...'):
         df, info = load_stock_data(ticker_symbol, start_input, end_input)
 
     if df.empty or len(df) < 5:
@@ -164,7 +151,6 @@ if run_btn or 'data_loaded' in st.session_state:
                     "Date": df.loc[idx, 'Date'],
                     "Amount": df.loc[idx, 'Dividends']
                 })
-                
                 if restrict_ex_date:
                     restricted_indices.add(idx)
                     if idx > 0: restricted_indices.add(idx - 1)
@@ -192,27 +178,19 @@ if run_btn or 'data_loaded' in st.session_state:
                 
                 if daily_low <= target_buy_price:
                     buy_price = target_buy_price
-                    
                     sell_date = pd.NaT
                     sell_price = 0.0
                     status = "Open"
                     
-                    # --- EXIT LOGIC ---
                     if strategy_mode == "Swing Trading":
                         target_sell_price = buy_price * (1 + (sell_profit_pct / 100.0))
-                        
                         for j in range(i + 1, len(df)):
                             if j in restricted_indices: continue
-                                
                             if df.loc[j, 'High'] >= target_sell_price:
                                 sell_date = df.loc[j, 'Date']
                                 sell_price = target_sell_price
                                 status = "Closed"
                                 break
-                    else:
-                        # Dip Accumulation: Never Sell
-                        status = "Open"
-                        # No sell_date, No sell_price
                     
                     trade_obj = {
                         "trade_id": len(potential_trades),
@@ -230,49 +208,109 @@ if run_btn or 'data_loaded' in st.session_state:
                         if sell_date not in trades_by_date:
                             trades_by_date[sell_date] = {'buys': [], 'sells': []}
                         trades_by_date[sell_date]['sells'].append(trade_obj)
-                        
+                    
                     drop_level += 1
                 else:
                     break
         
-        # --- 2. Simulation ---
+        # --- 2. Simulation Setup ---
+        
+        # A. Strategy Portfolio
         wallet = initial_investment
         active_holdings = set()
         trade_decisions = {}
-        trade_cash_flows = []
+        trade_cash_flows = [] # For Trade XIRR (Efficiency)
+        portfolio_cash_flows = [ (df.iloc[0]['Date'], -initial_investment) ] # For Portfolio XIRR
         
         total_interest_earned = 0.0
         total_dividends_earned = 0.0
+        total_invested_capital = initial_investment
         
         executed_count = 0
         missed_count = 0
         
+        # B. Buy & Hold (SIP) Benchmark
+        bh_shares = 0
+        bh_wallet = initial_investment
+        bh_cash_flows = [ (df.iloc[0]['Date'], -initial_investment) ]
+        
+        # Initial Buy for B&H
+        first_open_price = df.iloc[0]['Open'] # Or Close? Usually Close is easier or Open of first day
+        # Let's use Open of first day to simulate entering immediately
+        start_shares = int(bh_wallet // first_open_price)
+        bh_shares += start_shares
+        bh_wallet -= start_shares * first_open_price
+
+        # Simulation Loop
         prev_sim_date = df.iloc[0]['Date']
+        last_month_processed = -1
         
         for i in range(len(df)):
             curr_date = df.iloc[i]['Date']
+            curr_close = df.iloc[i]['Close'] # For B&H buying
             
-            # Interest Calculation
+            # --- Monthly Contribution Logic ---
+            # Check if we moved to a new month (simple logic: current month != last processed month)
+            # This ensures it happens on the FIRST trading day of the month found in data
+            if curr_date.month != last_month_processed:
+                if i > 0: # Don't double add on Day 1 if it's start of dataset (already handled by initial)
+                     # Wait, initial is initial. Monthly is Monthly.
+                     # Usually Monthly starts month 2 or month 1? 
+                     # Let's assume Month 1 contribution is the Initial Investment.
+                     # So we start adding from the NEXT month change.
+                     # OR: If user wants monthly add, they usually mean NEXT month or immediate?
+                     # Standard backtest: Initial is Day 0. Monthly starts next month or same month?
+                     # Let's simply add IF it's not the very first day of data to avoid double counting "Initial" as "Monthly"
+                     if monthly_investment > 0:
+                        # 1. Strategy Wallet
+                        wallet += monthly_investment
+                        portfolio_cash_flows.append((curr_date, -monthly_investment))
+                        total_invested_capital += monthly_investment
+                        
+                        # 2. Buy & Hold Wallet (SIP)
+                        bh_wallet += monthly_investment
+                        bh_cash_flows.append((curr_date, -monthly_investment))
+                        # Immediate Buy for B&H
+                        new_shares = int(bh_wallet // curr_close)
+                        if new_shares > 0:
+                            bh_shares += new_shares
+                            bh_wallet -= new_shares * curr_close
+                
+                last_month_processed = curr_date.month
+
+            # --- 1. Daily Interest ---
             days_delta = (curr_date - prev_sim_date).days
-            if days_delta > 0 and wallet > 0:
-                interest = wallet * (interest_rate_pct / 100.0 / 365.0) * days_delta
-                wallet += interest
-                total_interest_earned += interest
-            
-            # Dividend Collection
+            if days_delta > 0:
+                if wallet > 0:
+                    interest = wallet * (interest_rate_pct / 100.0 / 365.0) * days_delta
+                    wallet += interest
+                    total_interest_earned += interest
+                # Interest for B&H cash?
+                if bh_wallet > 0:
+                    bh_interest = bh_wallet * (interest_rate_pct / 100.0 / 365.0) * days_delta
+                    bh_wallet += bh_interest
+
+            # --- 2. Dividends ---
             if enable_dividends:
                 today_div_amount = df.loc[i, 'Dividends']
-                if today_div_amount > 0 and len(active_holdings) > 0:
-                    total_shares_held = len(active_holdings) * shares_per_trade
-                    payout = total_shares_held * today_div_amount
-                    wallet += payout
-                    total_dividends_earned += payout
+                if today_div_amount > 0:
+                    # Strategy
+                    if len(active_holdings) > 0:
+                        total_held = len(active_holdings) * shares_per_trade
+                        payout = total_held * today_div_amount
+                        wallet += payout
+                        total_dividends_earned += payout
+                    
+                    # Buy & Hold
+                    if bh_shares > 0:
+                        bh_payout = bh_shares * today_div_amount
+                        bh_wallet += bh_payout
 
-            # Trade Processing
+            # --- 3. Trading Activity (Strategy Only) ---
             if curr_date in trades_by_date:
                 day_activity = trades_by_date[curr_date]
                 
-                # Sells (Only happens in Swing Trading mode)
+                # Sells
                 for t in day_activity['sells']:
                     if t['trade_id'] in active_holdings:
                         revenue = t['sell_price'] * shares_per_trade
@@ -295,69 +333,68 @@ if run_btn or 'data_loaded' in st.session_state:
             
             prev_sim_date = curr_date
 
-        # --- 3. Valuation ---
+        # --- 4. Final Valuation ---
         last_close_price = df.iloc[-1]['Close']
-        open_position_value = 0
         final_date = df.iloc[-1]['Date']
         
+        # A. Strategy Value
+        open_position_value = 0
         for t in potential_trades:
-            # Value all open positions (in Accumulation mode, this is all executed trades)
             if trade_decisions.get(t['trade_id']) == "Executed" and t['status'] == "Open":
-                current_val = last_close_price * shares_per_trade
-                open_position_value += current_val
-                trade_cash_flows.append((final_date, current_val))
+                val = last_close_price * shares_per_trade
+                open_position_value += val
+                trade_cash_flows.append((final_date, val)) # Mark-to-market for Trade XIRR
 
-        final_portfolio_value = wallet + open_position_value
+        final_strategy_value = wallet + open_position_value
+        # Add final value to portfolio flows for XIRR
+        portfolio_cash_flows.append((final_date, final_strategy_value))
         
-        # --- 4. Metrics ---
-        start_price = df.iloc[0]['Close']
-        bh_shares = int(initial_investment // start_price)
-        bh_residual_cash = initial_investment - (bh_shares * start_price)
-        
-        bh_total_dividends = 0.0
-        if enable_dividends:
-            total_hist_dividends_per_share = df['Dividends'].sum()
-            bh_total_dividends = bh_shares * total_hist_dividends_per_share
-        
-        bh_final_value = (bh_shares * last_close_price) + bh_residual_cash + bh_total_dividends
-        bh_return_pct = (bh_final_value - initial_investment) / initial_investment
+        # B. Buy & Hold Value
+        final_bh_value = (bh_shares * last_close_price) + bh_wallet
+        bh_cash_flows.append((final_date, final_bh_value))
 
-        total_days = (end_input - start_input).days
-        years = total_days / 365.25
-        cagr = 0.0
-        if years > 0 and initial_investment > 0:
-            cagr = (final_portfolio_value / initial_investment) ** (1 / years) - 1
-            
-        trade_irr = xirr(trade_cash_flows)
+        # --- 5. Metrics Calculation ---
         
+        # Portfolio XIRR (Strategy)
+        strategy_xirr = xirr(portfolio_cash_flows)
+        
+        # Benchmark XIRR (Buy & Hold)
+        bh_xirr = xirr(bh_cash_flows)
+        
+        # Trade XIRR (Efficiency)
+        trade_efficiency_xirr = xirr(trade_cash_flows)
+        
+        # Yield Display
         curr_yield_display = "N/A"
         if 'dividendYield' in info and info['dividendYield'] is not None:
             curr_yield_display = f"{info['dividendYield']*100:.2f}%"
 
         # --- Dashboard ---
-        st.markdown(f"### 📊 Performance: {strategy_mode} (Yield: {curr_yield_display})")
+        st.markdown(f"### 📊 Performance Summary (Yield: {curr_yield_display})")
         
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Final Wallet Value", f"{currency_symbol}{final_portfolio_value:,.2f}", 
-                  delta=f"{currency_symbol}{final_portfolio_value - initial_investment:,.2f}")
-        c2.metric("Strategy CAGR", f"{cagr:.2%}")
-        c3.metric("Buy & Hold Return", f"{currency_symbol}{bh_final_value:,.2f}", 
-                  delta=f"{bh_return_pct:.2%}",
-                  help="Benchmark: Invest 100% on Day 1.")
-        c4.metric("Trade XIRR", f"{trade_irr:.2%}")
+        c1.metric("Final Wallet Value", f"{currency_symbol}{final_strategy_value:,.2f}", 
+                  delta=f"Invested: {currency_symbol}{total_invested_capital:,.0f}")
+        
+        c2.metric("Strategy Return (XIRR)", f"{strategy_xirr:.2%}", 
+                  help="Annualized return including all monthly contributions.")
+        
+        c3.metric("Buy & Hold Return (XIRR)", f"{bh_xirr:.2%}", 
+                  help="Benchmark: Investing Initial + Monthly amounts into the stock immediately.")
+        
+        c4.metric("Capital Efficiency (Trade XIRR)", f"{trade_efficiency_xirr:.2%}",
+                  help="Return on the specific capital used in trades (excluding idle cash drag).")
 
         c5, c6, c7, c8 = st.columns(4)
         c5.metric("Executed Trades", executed_count)
-        c6.metric("Total Passive Income", f"{currency_symbol}{total_interest_earned + total_dividends_earned:,.2f}",
-                  help=f"Interest: {currency_symbol}{total_interest_earned:,.0f} | Dividends: {currency_symbol}{total_dividends_earned:,.0f}")
+        c6.metric("Total Passive Income", f"{currency_symbol}{total_interest_earned + total_dividends_earned:,.2f}")
         c7.metric("Cash Balance", f"{currency_symbol}{wallet:,.2f}")
         c8.metric("Open Pos Value", f"{currency_symbol}{open_position_value:,.2f}")
         
+        # --- Log ---
         if enable_dividends and dividend_events:
-            with st.expander(f"📅 Dividend Schedule ({len(dividend_events)} payouts)"):
-                div_df = pd.DataFrame(dividend_events)
-                div_df['Date'] = div_df['Date'].dt.date
-                st.dataframe(div_df, use_container_width=True)
+             with st.expander(f"📅 Dividend Schedule ({len(dividend_events)} events)"):
+                st.dataframe(pd.DataFrame(dividend_events), use_container_width=True)
 
         st.markdown("### 📝 Detailed Trade Log")
         
@@ -373,10 +410,8 @@ if run_btn or 'data_loaded' in st.session_state:
                     profit_per_share = t['sell_price'] - t['buy_price']
                     sell_price_disp = t['sell_price']
                 else:
-                    # Open position profit (unrealized)
                     profit_per_share = last_close_price - t['buy_price']
                     sell_price_disp = last_close_price
-                
                 profit_total = profit_per_share * shares_per_trade
             
             final_log.append({
