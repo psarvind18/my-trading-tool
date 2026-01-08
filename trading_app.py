@@ -7,16 +7,13 @@ from datetime import date, timedelta
 st.set_page_config(page_title="SIP Trading Backtester", layout="wide")
 
 # --- Helper Functions ---
-@st.cache_data
-def load_stock_data(ticker_symbol, start_date, end_date):
+def fetch_data_from_yahoo(ticker_symbol, start_date, end_date):
     """
-    Fetches OHLC data AND Dividend/Split events.
-    Uses auto_adjust=False to get actual market prices.
+    Fetches data only when explicitly called.
     """
     try:
         ticker = yf.Ticker(ticker_symbol)
         df = ticker.history(start=start_date, end=end_date, auto_adjust=False)
-        # Ensure timezone naive
         df.index = df.index.tz_localize(None)
         df.reset_index(inplace=True)
         
@@ -25,32 +22,22 @@ def load_stock_data(ticker_symbol, start_date, end_date):
             
         return df, ticker.info
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
-        return pd.DataFrame(), {}
+        return None, str(e)
 
 def xirr(transactions):
-    """
-    Calculates XIRR (Extended Internal Rate of Return).
-    transactions: list of tuples [(date, amount)]
-    - Investments are NEGATIVE
-    - Final Value / Returns are POSITIVE
-    """
     if not transactions:
         return 0.0
     transactions.sort(key=lambda x: x[0])
-    
-    # Validation: Must have at least one negative and one positive
     amounts = [t[1] for t in transactions]
     if all(a >= 0 for a in amounts) or all(a <= 0 for a in amounts):
         return 0.0
-        
+    
     start_date = transactions[0][0]
-        
+    
     def npv(rate):
         total_npv = 0.0
         for dt, amt in transactions:
             days = (dt - start_date).days
-            # Protect against division by zero or extreme rates
             if rate <= -1.0: rate = -0.9999
             total_npv += amt / ((1 + rate) ** (days / 365.0))
         return total_npv
@@ -80,66 +67,72 @@ def xirr(transactions):
 # --- Main App ---
 st.title("🛡️ SIP & Trading Strategy Backtester")
 
+# --- Initialize Session State for Data ---
+if 'stock_data' not in st.session_state:
+    st.session_state['stock_data'] = None
+if 'stock_info' not in st.session_state:
+    st.session_state['stock_info'] = {}
+
 # --- Sidebar ---
 with st.sidebar:
-    st.header("1. Strategy Selection")
-    strategy_mode = st.radio(
-        "Choose Strategy Type:",
-        ("Swing Trading", "Dip Accumulation"),
-        help="Swing: Buy Dip & Sell High. \nAccumulation: Buy Dip & Hold Forever."
-    )
-    
-    st.divider()
-    
-    st.header("2. Market Data")
+    st.header("1. Data Loading")
     ticker_symbol = st.text_input("Ticker Symbol", value="VOO").upper()
-    currency_symbol = st.text_input("Currency Symbol", value="$")
     
     today = date.today()
     start_input = st.date_input("Start Date", value=date(today.year - 1, 1, 1))
     end_input = st.date_input("End Date", value=today)
     
+    # SEPARATE BUTTON TO LOAD DATA
+    if st.button("Step 1: Fetch Data"):
+        with st.spinner(f"Downloading {ticker_symbol}..."):
+            df, info = fetch_data_from_yahoo(ticker_symbol, start_input, end_input)
+            if df is not None and not df.empty:
+                st.session_state['stock_data'] = df
+                st.session_state['stock_info'] = info
+                st.session_state['data_ticker'] = ticker_symbol # Remember what we downloaded
+                st.success(f"Loaded {len(df)} days for {ticker_symbol}!")
+            else:
+                st.error(f"Failed to load data. Error: {info}")
+
     st.divider()
     
-    st.header("3. Trade Settings")
+    st.header("2. Strategy Settings")
+    # Strategy Inputs
+    strategy_mode = st.radio("Strategy Type:", ("Swing Trading", "Dip Accumulation"))
     buy_drop_pct = st.number_input("Buy Drop Step (%)", min_value=0.1, value=1.0, step=0.1)
     
     if strategy_mode == "Swing Trading":
         sell_profit_pct = st.number_input("Sell Profit Target (%)", min_value=0.1, value=4.0, step=0.1)
     else:
         sell_profit_pct = 0.0
-        st.info("Selling disabled in Accumulation mode.")
     
     st.divider()
     
-    st.header("4. Cash & Dividends")
+    st.header("3. Cash & Yield")
     interest_rate_pct = st.number_input("Cash Interest Rate (%)", min_value=0.0, value=4.5, step=0.1)
-    
     enable_dividends = st.checkbox("Include Dividends", value=True)
-    if enable_dividends:
-        restrict_ex_date = st.checkbox("Restrict Trade around Ex-Date", value=True)
-    else:
-        restrict_ex_date = False
+    restrict_ex_date = st.checkbox("Restrict Trade around Ex-Date", value=True) if enable_dividends else False
     
     st.divider()
     
-    st.header("5. Investment Plan")
-    initial_investment = st.number_input(f"Initial Investment ({currency_symbol})", value=10000.0, step=500.0)
-    monthly_investment = st.number_input(f"Monthly Contribution ({currency_symbol})", value=0.0, step=100.0, help="Added on the first trading day of each month.")
+    st.header("4. Investment Plan")
+    currency_symbol = st.text_input("Currency Symbol", value="$")
+    initial_investment = st.number_input(f"Initial Investment", value=10000.0, step=500.0)
+    monthly_investment = st.number_input(f"Monthly Contribution", value=0.0, step=100.0)
     shares_per_trade = st.number_input("Shares per Trade", min_value=1, value=1, step=1)
     
-    run_btn = st.button("Run Backtest")
+    calc_btn = st.button("Step 2: Run Backtest")
 
 # --- Execution ---
-if run_btn or 'data_loaded' in st.session_state:
-    st.session_state['data_loaded'] = True
+if st.session_state['stock_data'] is not None:
+    # Use data from memory
+    df = st.session_state['stock_data']
+    info = st.session_state['stock_info']
     
-    with st.spinner(f'Processing {ticker_symbol}...'):
-        df, info = load_stock_data(ticker_symbol, start_input, end_input)
+    # Display what data is currently loaded
+    st.info(f"Using loaded data for **{st.session_state.get('data_ticker', 'Unknown')}** ({len(df)} records). If you change Ticker/Dates, click 'Fetch Data' again.")
 
-    if df.empty or len(df) < 5:
-        st.error("No sufficient data found.")
-    else:
+    if calc_btn:
         # --- Pre-Calculation: Restricted Days ---
         restricted_indices = set()
         dividend_events = []
@@ -213,14 +206,12 @@ if run_btn or 'data_loaded' in st.session_state:
                 else:
                     break
         
-        # --- 2. Simulation Setup ---
-        
-        # A. Strategy Portfolio
+        # --- 2. Simulation ---
         wallet = initial_investment
         active_holdings = set()
         trade_decisions = {}
-        trade_cash_flows = [] # For Trade XIRR (Efficiency)
-        portfolio_cash_flows = [ (df.iloc[0]['Date'], -initial_investment) ] # For Portfolio XIRR
+        trade_cash_flows = [] 
+        portfolio_cash_flows = [ (df.iloc[0]['Date'], -initial_investment) ]
         
         total_interest_earned = 0.0
         total_dividends_earned = 0.0
@@ -229,88 +220,68 @@ if run_btn or 'data_loaded' in st.session_state:
         executed_count = 0
         missed_count = 0
         
-        # B. Buy & Hold (SIP) Benchmark
+        # B&H Benchmarking
         bh_shares = 0
         bh_wallet = initial_investment
         bh_cash_flows = [ (df.iloc[0]['Date'], -initial_investment) ]
         
-        # Initial Buy for B&H
-        first_open_price = df.iloc[0]['Open'] # Or Close? Usually Close is easier or Open of first day
-        # Let's use Open of first day to simulate entering immediately
+        first_open_price = df.iloc[0]['Open'] 
         start_shares = int(bh_wallet // first_open_price)
         bh_shares += start_shares
         bh_wallet -= start_shares * first_open_price
 
-        # Simulation Loop
         prev_sim_date = df.iloc[0]['Date']
         last_month_processed = -1
         
         for i in range(len(df)):
             curr_date = df.iloc[i]['Date']
-            curr_close = df.iloc[i]['Close'] # For B&H buying
+            curr_close = df.iloc[i]['Close']
             
-            # --- Monthly Contribution Logic ---
-            # Check if we moved to a new month (simple logic: current month != last processed month)
-            # This ensures it happens on the FIRST trading day of the month found in data
+            # Monthly Contribution
             if curr_date.month != last_month_processed:
-                if i > 0: # Don't double add on Day 1 if it's start of dataset (already handled by initial)
-                     # Wait, initial is initial. Monthly is Monthly.
-                     # Usually Monthly starts month 2 or month 1? 
-                     # Let's assume Month 1 contribution is the Initial Investment.
-                     # So we start adding from the NEXT month change.
-                     # OR: If user wants monthly add, they usually mean NEXT month or immediate?
-                     # Standard backtest: Initial is Day 0. Monthly starts next month or same month?
-                     # Let's simply add IF it's not the very first day of data to avoid double counting "Initial" as "Monthly"
-                     if monthly_investment > 0:
-                        # 1. Strategy Wallet
-                        wallet += monthly_investment
-                        portfolio_cash_flows.append((curr_date, -monthly_investment))
-                        total_invested_capital += monthly_investment
-                        
-                        # 2. Buy & Hold Wallet (SIP)
-                        bh_wallet += monthly_investment
-                        bh_cash_flows.append((curr_date, -monthly_investment))
-                        # Immediate Buy for B&H
-                        new_shares = int(bh_wallet // curr_close)
-                        if new_shares > 0:
-                            bh_shares += new_shares
-                            bh_wallet -= new_shares * curr_close
+                if monthly_investment > 0 and i > 0:
+                    # Strategy Wallet
+                    wallet += monthly_investment
+                    portfolio_cash_flows.append((curr_date, -monthly_investment))
+                    total_invested_capital += monthly_investment
+                    
+                    # B&H Wallet
+                    bh_wallet += monthly_investment
+                    bh_cash_flows.append((curr_date, -monthly_investment))
+                    new_shares = int(bh_wallet // curr_close)
+                    if new_shares > 0:
+                        bh_shares += new_shares
+                        bh_wallet -= new_shares * curr_close
                 
                 last_month_processed = curr_date.month
 
-            # --- 1. Daily Interest ---
+            # Interest
             days_delta = (curr_date - prev_sim_date).days
             if days_delta > 0:
                 if wallet > 0:
                     interest = wallet * (interest_rate_pct / 100.0 / 365.0) * days_delta
                     wallet += interest
                     total_interest_earned += interest
-                # Interest for B&H cash?
                 if bh_wallet > 0:
                     bh_interest = bh_wallet * (interest_rate_pct / 100.0 / 365.0) * days_delta
                     bh_wallet += bh_interest
 
-            # --- 2. Dividends ---
+            # Dividends
             if enable_dividends:
                 today_div_amount = df.loc[i, 'Dividends']
                 if today_div_amount > 0:
-                    # Strategy
                     if len(active_holdings) > 0:
                         total_held = len(active_holdings) * shares_per_trade
                         payout = total_held * today_div_amount
                         wallet += payout
                         total_dividends_earned += payout
-                    
-                    # Buy & Hold
                     if bh_shares > 0:
                         bh_payout = bh_shares * today_div_amount
                         bh_wallet += bh_payout
 
-            # --- 3. Trading Activity (Strategy Only) ---
+            # Trading
             if curr_date in trades_by_date:
                 day_activity = trades_by_date[curr_date]
-                
-                # Sells
                 for t in day_activity['sells']:
                     if t['trade_id'] in active_holdings:
                         revenue = t['sell_price'] * shares_per_trade
@@ -318,7 +289,6 @@ if run_btn or 'data_loaded' in st.session_state:
                         active_holdings.remove(t['trade_id'])
                         trade_cash_flows.append((curr_date, revenue))
                 
-                # Buys
                 for t in day_activity['buys']:
                     cost = t['buy_price'] * shares_per_trade
                     if wallet >= cost:
@@ -337,53 +307,37 @@ if run_btn or 'data_loaded' in st.session_state:
         last_close_price = df.iloc[-1]['Close']
         final_date = df.iloc[-1]['Date']
         
-        # A. Strategy Value
         open_position_value = 0
         for t in potential_trades:
             if trade_decisions.get(t['trade_id']) == "Executed" and t['status'] == "Open":
                 val = last_close_price * shares_per_trade
                 open_position_value += val
-                trade_cash_flows.append((final_date, val)) # Mark-to-market for Trade XIRR
+                trade_cash_flows.append((final_date, val))
 
         final_strategy_value = wallet + open_position_value
-        # Add final value to portfolio flows for XIRR
         portfolio_cash_flows.append((final_date, final_strategy_value))
         
-        # B. Buy & Hold Value
         final_bh_value = (bh_shares * last_close_price) + bh_wallet
         bh_cash_flows.append((final_date, final_bh_value))
 
-        # --- 5. Metrics Calculation ---
-        
-        # Portfolio XIRR (Strategy)
+        # --- 5. Metrics ---
         strategy_xirr = xirr(portfolio_cash_flows)
-        
-        # Benchmark XIRR (Buy & Hold)
         bh_xirr = xirr(bh_cash_flows)
-        
-        # Trade XIRR (Efficiency)
         trade_efficiency_xirr = xirr(trade_cash_flows)
         
-        # Yield Display
         curr_yield_display = "N/A"
         if 'dividendYield' in info and info['dividendYield'] is not None:
             curr_yield_display = f"{info['dividendYield']*100:.2f}%"
 
         # --- Dashboard ---
-        st.markdown(f"### 📊 Performance Summary (Yield: {curr_yield_display})")
+        st.markdown(f"### 📊 Performance: {strategy_mode} (Yield: {curr_yield_display})")
         
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Final Wallet Value", f"{currency_symbol}{final_strategy_value:,.2f}", 
                   delta=f"Invested: {currency_symbol}{total_invested_capital:,.0f}")
-        
-        c2.metric("Strategy Return (XIRR)", f"{strategy_xirr:.2%}", 
-                  help="Annualized return including all monthly contributions.")
-        
-        c3.metric("Buy & Hold Return (XIRR)", f"{bh_xirr:.2%}", 
-                  help="Benchmark: Investing Initial + Monthly amounts into the stock immediately.")
-        
-        c4.metric("Capital Efficiency (Trade XIRR)", f"{trade_efficiency_xirr:.2%}",
-                  help="Return on the specific capital used in trades (excluding idle cash drag).")
+        c2.metric("Strategy Return (XIRR)", f"{strategy_xirr:.2%}")
+        c3.metric("Buy & Hold Return (XIRR)", f"{bh_xirr:.2%}")
+        c4.metric("Capital Efficiency (Trade XIRR)", f"{trade_efficiency_xirr:.2%}")
 
         c5, c6, c7, c8 = st.columns(4)
         c5.metric("Executed Trades", executed_count)
@@ -391,7 +345,6 @@ if run_btn or 'data_loaded' in st.session_state:
         c7.metric("Cash Balance", f"{currency_symbol}{wallet:,.2f}")
         c8.metric("Open Pos Value", f"{currency_symbol}{open_position_value:,.2f}")
         
-        # --- Log ---
         if enable_dividends and dividend_events:
              with st.expander(f"📅 Dividend Schedule ({len(dividend_events)} events)"):
                 st.dataframe(pd.DataFrame(dividend_events), use_container_width=True)
@@ -443,5 +396,6 @@ if run_btn or 'data_loaded' in st.session_state:
         fmt_df['Total P&L'] = fmt_df['Total P&L'].map(lambda x: f"{currency_symbol}{x:,.2f}")
         
         st.dataframe(fmt_df.style.apply(style_rows, axis=1), use_container_width=True)
+
 else:
-    st.info("👈 Enter settings and click **Run Backtest**.")
+    st.info("👈 Please click **'Step 1: Fetch Data'** in the sidebar to begin.")
