@@ -161,5 +161,220 @@ def run_simulation(df, params):
                 }
                 potential_trades.append(trade_obj)
                 trades_by_date[daily_date]['buys'].append(trade_obj)
+                
+                # --- FIXED LINE HERE ---
                 if status == "Closed":
-                    if sell_date not in trades
+                    if sell_date not in trades_by_date:
+                        trades_by_date[sell_date] = {'buys': [], 'sells': []}
+                    trades_by_date[sell_date]['sells'].append(trade_obj)
+                
+                drop_level += 1
+            else:
+                break
+    
+    # --- 2. Simulation ---
+    wallet = initial_investment
+    active_holdings = set()
+    trade_decisions = {}
+    trade_cash_flows = [] 
+    portfolio_cash_flows = [ (df.iloc[0]['Date'], -initial_investment) ]
+    
+    total_interest_earned = 0.0
+    total_dividends_earned = 0.0
+    total_invested_capital = initial_investment
+    
+    executed_count = 0
+    missed_count = 0
+    
+    # B&H Benchmarking
+    bh_shares = 0
+    bh_wallet = initial_investment
+    bh_cash_flows = [ (df.iloc[0]['Date'], -initial_investment) ]
+    first_open_price = df.iloc[0]['Open'] 
+    start_shares = int(bh_wallet // first_open_price)
+    bh_shares += start_shares
+    bh_wallet -= start_shares * first_open_price
+
+    prev_sim_date = df.iloc[0]['Date']
+    last_month_processed = -1
+    
+    for i in range(len(df)):
+        curr_date = df.iloc[i]['Date']
+        curr_close = df.iloc[i]['Close']
+        
+        # Monthly Contribution
+        if curr_date.month != last_month_processed:
+            if monthly_investment > 0 and i > 0:
+                wallet += monthly_investment
+                portfolio_cash_flows.append((curr_date, -monthly_investment))
+                total_invested_capital += monthly_investment
+                
+                bh_wallet += monthly_investment
+                bh_cash_flows.append((curr_date, -monthly_investment))
+                new_shares = int(bh_wallet // curr_close)
+                if new_shares > 0:
+                    bh_shares += new_shares
+                    bh_wallet -= new_shares * curr_close
+            last_month_processed = curr_date.month
+
+        # Interest
+        days_delta = (curr_date - prev_sim_date).days
+        if days_delta > 0:
+            if wallet > 0:
+                interest = wallet * (interest_rate_pct / 100.0 / 365.0) * days_delta
+                wallet += interest
+                total_interest_earned += interest
+            if bh_wallet > 0:
+                bh_interest = bh_wallet * (interest_rate_pct / 100.0 / 365.0) * days_delta
+                bh_wallet += bh_interest
+
+        # Dividends
+        if enable_dividends:
+            today_div_amount = df.loc[i, 'Dividends']
+            if today_div_amount > 0:
+                if len(active_holdings) > 0:
+                    total_held = len(active_holdings) * shares_per_trade
+                    payout = total_held * today_div_amount
+                    wallet += payout
+                    total_dividends_earned += payout
+                if bh_shares > 0:
+                    bh_payout = bh_shares * today_div_amount
+                    bh_wallet += bh_payout
+
+        # Trading
+        if curr_date in trades_by_date:
+            day_activity = trades_by_date[curr_date]
+            for t in day_activity['sells']:
+                if t['trade_id'] in active_holdings:
+                    revenue = t['sell_price'] * shares_per_trade
+                    wallet += revenue
+                    active_holdings.remove(t['trade_id'])
+                    trade_cash_flows.append((curr_date, revenue))
+            
+            for t in day_activity['buys']:
+                cost = t['buy_price'] * shares_per_trade
+                if wallet >= cost:
+                    wallet -= cost
+                    active_holdings.add(t['trade_id'])
+                    trade_decisions[t['trade_id']] = "Executed"
+                    executed_count += 1
+                    trade_cash_flows.append((curr_date, -cost))
+                else:
+                    trade_decisions[t['trade_id']] = "Missed"
+                    missed_count += 1
+        
+        prev_sim_date = curr_date
+
+    # --- 4. Valuation ---
+    last_close_price = df.iloc[-1]['Close']
+    final_date = df.iloc[-1]['Date']
+    
+    open_position_value = 0
+    for t in potential_trades:
+        if trade_decisions.get(t['trade_id']) == "Executed" and t['status'] == "Open":
+            val = last_close_price * shares_per_trade
+            open_position_value += val
+            trade_cash_flows.append((final_date, val))
+
+    final_strategy_value = wallet + open_position_value
+    portfolio_cash_flows.append((final_date, final_strategy_value))
+    
+    final_bh_value = (bh_shares * last_close_price) + bh_wallet
+    bh_cash_flows.append((final_date, final_bh_value))
+
+    # --- Metrics ---
+    strategy_xirr = xirr(portfolio_cash_flows)
+    bh_xirr = xirr(bh_cash_flows)
+    trade_efficiency_xirr = xirr(trade_cash_flows)
+    
+    return {
+        "final_value": final_strategy_value,
+        "invested_capital": total_invested_capital,
+        "strategy_xirr": strategy_xirr,
+        "bh_xirr": bh_xirr,
+        "trade_xirr": trade_efficiency_xirr,
+        "executed_trades": executed_count,
+        "missed_trades": missed_count,
+        "passive_income": total_interest_earned + total_dividends_earned,
+        "wallet_cash": wallet,
+        "open_value": open_position_value,
+        "trades": potential_trades,
+        "decisions": trade_decisions,
+        "dividend_events": dividend_events,
+        "bh_final_value": final_bh_value
+    }
+
+# --- Main App ---
+st.title("🛡️ Algorithmic Strategy Optimizer")
+
+if 'stock_data' not in st.session_state:
+    st.session_state['stock_data'] = None
+if 'stock_info' not in st.session_state:
+    st.session_state['stock_info'] = {}
+
+# --- Sidebar ---
+with st.sidebar:
+    st.header("1. Data Loading")
+    ticker_symbol = st.text_input("Ticker Symbol", value="VOO").upper()
+    start_input = st.date_input("Start Date", value=date.today().replace(year=date.today().year - 2))
+    end_input = st.date_input("End Date", value=date.today())
+    
+    if st.button("Step 1: Fetch Data"):
+        with st.spinner(f"Downloading {ticker_symbol}..."):
+            df, info = fetch_data_from_yahoo(ticker_symbol, start_input, end_input)
+            if df is not None and not df.empty:
+                st.session_state['stock_data'] = df
+                st.session_state['stock_info'] = info
+                st.session_state['data_ticker'] = ticker_symbol
+                st.success(f"Loaded {len(df)} days!")
+            else:
+                st.error(f"Error: {info}")
+
+    st.divider()
+    
+    st.header("2. Base Strategy Settings")
+    strategy_mode = st.selectbox("Strategy Type", ["Swing Trading", "Dip Accumulation"])
+    buy_drop_pct = st.number_input("Buy Drop Step (%)", 1.0, step=0.1)
+    
+    sell_profit_pct = 0.0
+    use_trailing_stop = False
+    trailing_stop_pct = 0.0
+    
+    if strategy_mode == "Swing Trading":
+        sell_profit_pct = st.number_input("Activation Target (%)", 4.0, step=0.1)
+        use_trailing_stop = st.checkbox("Enable Trailing Stop", value=True)
+        if use_trailing_stop:
+            trailing_stop_pct = st.number_input("Trailing Stop (%) (Base Value)", 2.0, step=0.1)
+            
+    st.divider()
+    st.header("3. Financials")
+    interest_rate_pct = st.number_input("Cash Interest (%)", min_value=0.0, value=3.75, step=0.25, format="%.2f")
+    enable_dividends = st.checkbox("Include Dividends", True)
+    restrict_ex_date = st.checkbox("Restrict Ex-Date", True) if enable_dividends else False
+    
+    st.divider()
+    st.header("4. Wallet")
+    currency_symbol = st.text_input("Currency", "$")
+    initial_investment = st.number_input("Initial Inv.", 10000.0, step=500.0)
+    monthly_investment = st.number_input("Monthly Contrib.", 0.0, step=100.0)
+    shares_per_trade = st.number_input("Shares/Trade", 1, step=1)
+
+# --- TABS ---
+tab1, tab2 = st.tabs(["📊 Single Backtest", "🚀 Optimizer (Parameter Sweep)"])
+
+if st.session_state['stock_data'] is not None:
+    df = st.session_state['stock_data']
+    info = st.session_state['stock_info']
+    
+    # Pack parameters
+    current_params = {
+        'strategy_mode': strategy_mode,
+        'buy_drop_pct': buy_drop_pct,
+        'sell_profit_pct': sell_profit_pct,
+        'use_trailing_stop': use_trailing_stop,
+        'trailing_stop_pct': trailing_stop_pct,
+        'interest_rate_pct': interest_rate_pct,
+        'enable_dividends': enable_dividends,
+        'restrict_ex_date': restrict_ex_date,
+        'initial_investment': initial_investment,
+        'monthly_investment': monthly
