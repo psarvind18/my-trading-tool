@@ -161,11 +161,8 @@ def run_simulation(df, params):
                 }
                 potential_trades.append(trade_obj)
                 trades_by_date[daily_date]['buys'].append(trade_obj)
-                
-                # --- FIXED LINE HERE ---
                 if status == "Closed":
-                    if sell_date not in trades_by_date:
-                        trades_by_date[sell_date] = {'buys': [], 'sells': []}
+                    if sell_date not in trades_by_date: trades_by_date[sell_date] = {'buys': [], 'sells': []}
                     trades_by_date[sell_date]['sells'].append(trade_obj)
                 
                 drop_level += 1
@@ -377,4 +374,123 @@ if st.session_state['stock_data'] is not None:
         'enable_dividends': enable_dividends,
         'restrict_ex_date': restrict_ex_date,
         'initial_investment': initial_investment,
-        'monthly_investment': monthly
+        'monthly_investment': monthly_investment,
+        'shares_per_trade': shares_per_trade
+    }
+
+    # --- TAB 1: SINGLE RUN ---
+    with tab1:
+        if st.button("Run Single Backtest"):
+            res = run_simulation(df, current_params)
+            
+            # Metrics
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Final Value", f"{currency_symbol}{res['final_value']:,.2f}", delta=f"Inv: {currency_symbol}{res['invested_capital']:,.0f}")
+            c2.metric("Strategy XIRR", f"{res['strategy_xirr']:.2%}")
+            c3.metric("Buy & Hold XIRR", f"{res['bh_xirr']:.2%}")
+            c4.metric("Trade Efficiency", f"{res['trade_xirr']:.2%}")
+            
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("Trades", f"{res['executed_trades']} / {res['executed_trades'] + res['missed_trades']}")
+            c6.metric("Passive Income", f"{currency_symbol}{res['passive_income']:,.2f}")
+            c7.metric("Cash Balance", f"{currency_symbol}{res['wallet_cash']:,.2f}")
+            c8.metric("Open Value", f"{currency_symbol}{res['open_value']:,.2f}")
+
+            # Logs
+            if enable_dividends and res['dividend_events']:
+                with st.expander(f"📅 Dividend Schedule ({len(res['dividend_events'])})"):
+                    st.dataframe(pd.DataFrame(res['dividend_events']))
+            
+            st.subheader("Trade Log")
+            # Build DF
+            logs = []
+            last_close = df.iloc[-1]['Close']
+            for t in res['trades']:
+                decision = res['decisions'].get(t['trade_id'], "Missed")
+                p_share = 0.0
+                s_price = 0.0
+                if decision == "Executed":
+                    s_price = t['sell_price'] if t['status'] == "Closed" else last_close
+                    p_share = s_price - t['buy_price']
+                
+                logs.append({
+                    "Date": t['buy_date'].strftime('%Y-%m-%d'),
+                    "Buy": f"{currency_symbol}{t['buy_price']:.2f}",
+                    "Sell": f"{currency_symbol}{s_price:.2f}" if decision == "Executed" else "-",
+                    "Profit": f"{currency_symbol}{p_share * shares_per_trade:.2f}" if decision == "Executed" else "-",
+                    "Status": t['status'],
+                    "Result": decision
+                })
+            st.dataframe(pd.DataFrame(logs), use_container_width=True)
+
+    # --- TAB 2: OPTIMIZER ---
+    with tab2:
+        st.write("Automatically test different parameters to find the 'Sweet Spot'.")
+        
+        opt_col1, opt_col2 = st.columns(2)
+        with opt_col1:
+            optimize_target = st.selectbox("Parameter to Optimize", 
+                                         ["Trailing Stop %", "Activation Target %", "Buy Drop %"])
+        with opt_col2:
+            st.write("Range Settings")
+            r_start = st.number_input("Start %", 0.5, 5.0, 1.0)
+            r_end = st.number_input("End %", 2.0, 20.0, 10.0)
+            r_step = st.number_input("Step %", 0.1, 2.0, 0.5)
+
+        if st.button("Run Optimization Sweep"):
+            if strategy_mode != "Swing Trading" and optimize_target in ["Trailing Stop %", "Activation Target %"]:
+                st.error("Switch Strategy Mode to 'Swing Trading' to optimize Sell parameters.")
+            else:
+                results_sweep = []
+                import numpy as np
+                
+                # Generate range
+                test_values = np.arange(r_start, r_end + 0.001, r_step)
+                
+                bar = st.progress(0)
+                best_xirr = -999.0
+                best_val = 0.0
+                
+                for idx, val in enumerate(test_values):
+                    # Update params
+                    temp_params = current_params.copy()
+                    if optimize_target == "Trailing Stop %":
+                        temp_params['use_trailing_stop'] = True
+                        temp_params['trailing_stop_pct'] = val
+                    elif optimize_target == "Activation Target %":
+                        temp_params['sell_profit_pct'] = val
+                    elif optimize_target == "Buy Drop %":
+                        temp_params['buy_drop_pct'] = val
+                    
+                    # Run
+                    res = run_simulation(df, temp_params)
+                    results_sweep.append({
+                        "Parameter Value": round(val, 2),
+                        "Strategy XIRR": res['strategy_xirr'] * 100.0, # Convert to % for chart
+                        "Profit": res['final_value'] - res['invested_capital']
+                    })
+                    
+                    if res['strategy_xirr'] > best_xirr:
+                        best_xirr = res['strategy_xirr']
+                        best_val = val
+                    
+                    bar.progress((idx + 1) / len(test_values))
+                
+                bar.empty()
+                
+                # Plot results
+                res_df = pd.DataFrame(results_sweep)
+                
+                st.success(f"🏆 Best {optimize_target}: **{best_val:.2f}%** (XIRR: {best_xirr:.2%})")
+                
+                chart = alt.Chart(res_df).mark_line(point=True).encode(
+                    x=alt.X('Parameter Value', title=f'{optimize_target}'),
+                    y=alt.Y('Strategy XIRR', title='Return (XIRR %)'),
+                    tooltip=['Parameter Value', 'Strategy XIRR', 'Profit']
+                ).interactive()
+                
+                st.altair_chart(chart, use_container_width=True)
+                st.dataframe(res_df.set_index("Parameter Value"))
+
+else:
+    st.info("👈 Step 1: Load Data to begin.")
