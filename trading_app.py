@@ -121,7 +121,7 @@ def run_simulation(df, params):
                                 status = "Closed"
                                 break
                     else:
-                        # Trailing Stop
+                        # Trailing Stop with FLOOR Logic
                         trailing_active = False
                         peak_price = 0.0
                         
@@ -131,24 +131,36 @@ def run_simulation(df, params):
                             day_low = df.loc[j, 'Low']
                             
                             if not trailing_active:
+                                # Check for Activation
                                 if day_high >= target_activation_price:
                                     trailing_active = True
                                     peak_price = day_high
-                                    current_stop = peak_price * (1 - (trailing_stop_pct / 100.0))
+                                    
+                                    # Calculate Stop (Max of Trail or Activation Price)
+                                    calc_stop = peak_price * (1 - (trailing_stop_pct / 100.0))
+                                    current_stop = max(calc_stop, target_activation_price)
+                                    
+                                    # Did we crash below this stop on the same day?
                                     if day_low <= current_stop:
                                         sell_date = df.loc[j, 'Date']
                                         sell_price = current_stop
                                         status = "Closed"
                                         break
                             else:
-                                current_stop = peak_price * (1 - (trailing_stop_pct / 100.0))
+                                # Already active, update Peak
+                                if day_high > peak_price:
+                                    peak_price = day_high
+                                
+                                # Calculate Stop (Max of Trail or Activation Price)
+                                calc_stop = peak_price * (1 - (trailing_stop_pct / 100.0))
+                                current_stop = max(calc_stop, target_activation_price)
+                                
+                                # Check if hit
                                 if day_low <= current_stop:
                                     sell_date = df.loc[j, 'Date']
                                     sell_price = current_stop
                                     status = "Closed"
                                     break
-                                if day_high > peak_price:
-                                    peak_price = day_high
                         
                 trade_obj = {
                     "trade_id": len(potential_trades),
@@ -161,8 +173,10 @@ def run_simulation(df, params):
                 }
                 potential_trades.append(trade_obj)
                 trades_by_date[daily_date]['buys'].append(trade_obj)
+                
                 if status == "Closed":
-                    if sell_date not in trades_by_date: trades_by_date[sell_date] = {'buys': [], 'sells': []}
+                    if sell_date not in trades_by_date:
+                        trades_by_date[sell_date] = {'buys': [], 'sells': []}
                     trades_by_date[sell_date]['sells'].append(trade_obj)
                 
                 drop_level += 1
