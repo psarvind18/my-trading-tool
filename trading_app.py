@@ -331,30 +331,30 @@ with st.sidebar:
     
     st.header("2. Base Strategy Settings")
     strategy_mode = st.selectbox("Strategy Type", ["Swing Trading", "Dip Accumulation"])
-    buy_drop_pct = st.number_input("Buy Drop Step (%)", 1.0, step=0.1)
+    buy_drop_pct = st.number_input("Buy Drop Step (%)", value=1.0, step=0.1)
     
     sell_profit_pct = 0.0
     use_trailing_stop = False
     trailing_stop_pct = 0.0
     
     if strategy_mode == "Swing Trading":
-        sell_profit_pct = st.number_input("Activation Target (%)", 4.0, step=0.1)
+        sell_profit_pct = st.number_input("Activation Target (%)", value=4.0, step=0.1)
         use_trailing_stop = st.checkbox("Enable Trailing Stop", value=True)
         if use_trailing_stop:
-            trailing_stop_pct = st.number_input("Trailing Stop (%) (Base Value)", 2.0, step=0.1)
+            trailing_stop_pct = st.number_input("Trailing Stop (%) (Base Value)", value=2.0, step=0.1)
             
     st.divider()
     st.header("3. Financials")
-    interest_rate_pct = st.number_input("Cash Interest (%)", min_value=0.0, value=3.75, step=0.25, format="%.2f")
+    interest_rate_pct = st.number_input("Cash Interest (%)", value=3.75, step=0.25, format="%.2f")
     enable_dividends = st.checkbox("Include Dividends", True)
     restrict_ex_date = st.checkbox("Restrict Ex-Date", True) if enable_dividends else False
     
     st.divider()
     st.header("4. Wallet")
     currency_symbol = st.text_input("Currency", "$")
-    initial_investment = st.number_input("Initial Inv.", 10000.0, step=500.0)
-    monthly_investment = st.number_input("Monthly Contrib.", 0.0, step=100.0)
-    shares_per_trade = st.number_input("Shares/Trade", 1, step=1)
+    initial_investment = st.number_input("Initial Inv.", value=1000.0, step=500.0)
+    monthly_investment = st.number_input("Monthly Contrib.", value=0.0, step=100.0)
+    shares_per_trade = st.number_input("Shares/Trade", value=1, step=1)
 
 # --- TABS ---
 tab1, tab2 = st.tabs(["📊 Single Backtest", "🚀 Optimizer (Parameter Sweep)"])
@@ -433,9 +433,9 @@ if st.session_state['stock_data'] is not None:
                                          ["Trailing Stop %", "Activation Target %", "Buy Drop %"])
         with opt_col2:
             st.write("Range Settings")
-            r_start = st.number_input("Start %", 0.5, 5.0, 1.0)
-            r_end = st.number_input("End %", 2.0, 20.0, 10.0)
-            r_step = st.number_input("Step %", 0.1, 2.0, 0.5)
+            r_start = st.number_input("Start %", value=1.0, step=0.5)
+            r_end = st.number_input("End %", value=10.0, step=0.5)
+            r_step = st.number_input("Step %", value=0.5, step=0.1)
 
         if st.button("Run Optimization Sweep"):
             if strategy_mode != "Swing Trading" and optimize_target in ["Trailing Stop %", "Activation Target %"]:
