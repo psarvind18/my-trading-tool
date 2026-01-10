@@ -69,7 +69,6 @@ def run_simulation(df, params):
     initial_investment = params['initial_investment']
     monthly_investment = params['monthly_investment']
     
-    # Trade Sizing Parameters
     trade_size_type = params['trade_size_type']
     shares_per_trade = params['shares_per_trade']
     min_trade_amt = params['min_trade_amt']
@@ -139,7 +138,6 @@ def run_simulation(df, params):
                                 if day_high >= target_activation_price:
                                     trailing_active = True
                                     peak_price = day_high
-                                    # Calc Stop with Floor
                                     calc_stop = peak_price * (1 - (trailing_stop_pct / 100.0))
                                     current_stop = max(calc_stop, target_activation_price)
                                     
@@ -169,7 +167,7 @@ def run_simulation(df, params):
                     "sell_date": sell_date,
                     "sell_price": sell_price,
                     "status": status,
-                    "quantity": 0.0 # Will be filled in Simulation Phase
+                    "quantity": 0.0
                 }
                 potential_trades.append(trade_obj)
                 trades_by_date[daily_date]['buys'].append(trade_obj)
@@ -199,16 +197,18 @@ def run_simulation(df, params):
     
     current_total_shares = 0.0
     
-    # B&H Benchmarking (Allow fractional for fair comparison)
+    # Daily Tracking for Plotting
+    daily_history = []
+    
+    # B&H Benchmarking
     bh_shares = 0.0
     bh_wallet = initial_investment
     bh_cash_flows = [ (df.iloc[0]['Date'], -initial_investment) ]
     first_open_price = df.iloc[0]['Open'] 
     
-    # Initial B&H Buy (All in)
     start_shares = bh_wallet / first_open_price
     bh_shares += start_shares
-    bh_wallet = 0.0 # Fully invested
+    bh_wallet = 0.0
 
     prev_sim_date = df.iloc[0]['Date']
     last_month_processed = -1
@@ -220,12 +220,10 @@ def run_simulation(df, params):
         # Monthly Contribution
         if curr_date.month != last_month_processed:
             if monthly_investment > 0 and i > 0:
-                # Strategy
                 wallet += monthly_investment
                 portfolio_cash_flows.append((curr_date, -monthly_investment))
                 total_invested_capital += monthly_investment
                 
-                # B&H (Auto Invest)
                 bh_wallet += monthly_investment
                 bh_cash_flows.append((curr_date, -monthly_investment))
                 new_shares = bh_wallet / curr_close
@@ -240,7 +238,6 @@ def run_simulation(df, params):
                 interest = wallet * (interest_rate_pct / 100.0 / 365.0) * days_delta
                 wallet += interest
                 total_interest_earned += interest
-            # B&H technically has 0 cash usually, but logic remains valid
             if bh_wallet > 0:
                 bh_interest = bh_wallet * (interest_rate_pct / 100.0 / 365.0) * days_delta
                 bh_wallet += bh_interest
@@ -249,37 +246,28 @@ def run_simulation(df, params):
         if enable_dividends:
             today_div_amount = df.loc[i, 'Dividends']
             if today_div_amount > 0:
-                # Strategy
                 if current_total_shares > 0:
                     payout = current_total_shares * today_div_amount
                     wallet += payout
                     total_dividends_earned += payout
-                # B&H
                 if bh_shares > 0:
                     bh_payout = bh_shares * today_div_amount
-                    # Reinvest Dividends? Standard B&H usually reinvests or holds cash. 
-                    # Let's hold as cash to be simple/consistent with strategy wallet logic.
                     bh_wallet += bh_payout
 
         # Trading
         if curr_date in trades_by_date:
             day_activity = trades_by_date[curr_date]
             
-            # 1. Sells
             for t in day_activity['sells']:
                 if t['trade_id'] in active_holdings:
-                    # Revenue depends on how many shares we bought for THIS trade
                     qty_held = t['quantity']
                     revenue = t['sell_price'] * qty_held
-                    
                     wallet += revenue
                     active_holdings.remove(t['trade_id'])
                     current_total_shares -= qty_held
                     trade_cash_flows.append((curr_date, revenue))
             
-            # 2. Buys
             for t in day_activity['buys']:
-                # Determine Size
                 qty_to_buy = 0.0
                 cost = 0.0
                 
@@ -288,27 +276,6 @@ def run_simulation(df, params):
                     cost = qty_to_buy * t['buy_price']
                     
                     if wallet >= cost:
-                        wallet -= cost
-                        t['quantity'] = qty_to_buy # Store for selling later
-                        active_holdings.add(t['trade_id'])
-                        current_total_shares += qty_to_buy
-                        trade_decisions[t['trade_id']] = "Executed"
-                        executed_count += 1
-                        trade_cash_flows.append((curr_date, -cost))
-                    else:
-                        trade_decisions[t['trade_id']] = "Missed"
-                        missed_count += 1
-                        
-                else: # Dollar Amount Mode
-                    # Logic: Buy Max if possible. Else Buy Wallet. But must be >= Min.
-                    target_spend = max_trade_amt
-                    possible_spend = min(wallet, target_spend)
-                    
-                    if possible_spend >= min_trade_amt:
-                        # Executing
-                        cost = possible_spend
-                        qty_to_buy = cost / t['buy_price']
-                        
                         wallet -= cost
                         t['quantity'] = qty_to_buy
                         active_holdings.add(t['trade_id'])
@@ -319,6 +286,35 @@ def run_simulation(df, params):
                     else:
                         trade_decisions[t['trade_id']] = "Missed"
                         missed_count += 1
+                        
+                else: 
+                    target_spend = max_trade_amt
+                    possible_spend = min(wallet, target_spend)
+                    
+                    if possible_spend >= min_trade_amt:
+                        cost = possible_spend
+                        qty_to_buy = cost / t['buy_price']
+                        wallet -= cost
+                        t['quantity'] = qty_to_buy
+                        active_holdings.add(t['trade_id'])
+                        current_total_shares += qty_to_buy
+                        trade_decisions[t['trade_id']] = "Executed"
+                        executed_count += 1
+                        trade_cash_flows.append((curr_date, -cost))
+                    else:
+                        trade_decisions[t['trade_id']] = "Missed"
+                        missed_count += 1
+        
+        # --- Record Daily State ---
+        daily_open_value = current_total_shares * curr_close
+        daily_total_value = wallet + daily_open_value
+        
+        daily_history.append({
+            "Date": curr_date,
+            "Total Value": daily_total_value,
+            "Cash": wallet,
+            "Open Positions": daily_open_value
+        })
         
         prev_sim_date = curr_date
 
@@ -358,7 +354,8 @@ def run_simulation(df, params):
         "trades": potential_trades,
         "decisions": trade_decisions,
         "dividend_events": dividend_events,
-        "bh_final_value": final_bh_value
+        "bh_final_value": final_bh_value,
+        "daily_history": daily_history # Added this
     }
 
 # --- Main App ---
@@ -415,7 +412,6 @@ with st.sidebar:
     initial_investment = st.number_input("Initial Inv.", value=1000.0, step=500.0)
     monthly_investment = st.number_input("Monthly Contrib.", value=0.0, step=100.0)
     
-    # NEW: Trade Size Type
     trade_size_type = st.selectbox("Trade Size Type", ["Fixed Shares", "Dollar Amount"])
     
     shares_per_trade = 1
@@ -501,6 +497,26 @@ if st.session_state['stock_data'] is not None:
                     "Result": decision
                 })
             st.dataframe(pd.DataFrame(logs), use_container_width=True)
+            
+            # --- NEW CHART SECTION ---
+            st.subheader("📈 Portfolio Growth Over Time")
+            
+            # Prepare Data for Chart
+            hist_df = pd.DataFrame(res['daily_history'])
+            
+            # Melt for Multi-Line Chart (Long Format)
+            chart_df = hist_df.melt(id_vars='Date', value_vars=['Total Value', 'Cash', 'Open Positions'], 
+                                    var_name='Metric', value_name='Value')
+            
+            # Create Chart
+            chart = alt.Chart(chart_df).mark_line().encode(
+                x='Date:T',
+                y=alt.Y('Value:Q', title=f'Value ({currency_symbol})'),
+                color='Metric:N',
+                tooltip=['Date', 'Metric', 'Value']
+            ).properties(height=400).interactive()
+            
+            st.altair_chart(chart, use_container_width=True)
 
     # --- TAB 2: OPTIMIZER ---
     with tab2:
