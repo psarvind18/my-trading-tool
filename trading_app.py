@@ -314,8 +314,6 @@ def run_simulation(df, params):
         # --- Record Daily State ---
         daily_open_value = current_total_shares * curr_close
         daily_total_value = wallet + daily_open_value
-        
-        # Track B&H Value
         daily_bh_value = (bh_shares * curr_close) + bh_wallet
         
         daily_history.append({
@@ -508,25 +506,37 @@ if st.session_state['stock_data'] is not None:
                 })
             st.dataframe(pd.DataFrame(logs), use_container_width=True)
             
-            # --- NEW CHART SECTION ---
+            # --- NEW CHART SECTION (UPDATED with Toggle) ---
             st.subheader("📈 Portfolio Growth Over Time")
             
             # Prepare Data for Chart
             hist_df = pd.DataFrame(res['daily_history'])
             
-            # Melt for Multi-Line Chart (Long Format)
-            chart_df = hist_df.melt(id_vars='Date', value_vars=['Total Value', 'Buy & Hold', 'Cash', 'Open Positions'], 
+            # 1. Melt for Multi-Line Chart
+            all_metrics = ['Total Value', 'Buy & Hold', 'Cash', 'Open Positions']
+            chart_df = hist_df.melt(id_vars='Date', value_vars=all_metrics, 
                                     var_name='Metric', value_name='Value')
             
-            # Create Chart
-            chart = alt.Chart(chart_df).mark_line().encode(
-                x='Date:T',
-                y=alt.Y('Value:Q', title=f'Value ({currency_symbol})'),
-                color='Metric:N',
-                tooltip=['Date', 'Metric', 'Value']
-            ).properties(height=400).interactive()
+            # 2. Add Multiselect for Toggling
+            selected_metrics = st.multiselect(
+                "Select Metrics to Display:",
+                options=all_metrics,
+                default=all_metrics
+            )
             
-            st.altair_chart(chart, use_container_width=True)
+            # 3. Filter Data
+            filtered_chart_df = chart_df[chart_df['Metric'].isin(selected_metrics)]
+            
+            if not filtered_chart_df.empty:
+                chart = alt.Chart(filtered_chart_df).mark_line().encode(
+                    x='Date:T',
+                    y=alt.Y('Value:Q', title=f'Value ({currency_symbol})'),
+                    color='Metric:N',
+                    tooltip=['Date', 'Metric', 'Value']
+                ).properties(height=400).interactive()
+                st.altair_chart(chart, use_container_width=True)
+            else:
+                st.warning("Select at least one metric to view the chart.")
 
     # --- TAB 2: OPTIMIZER ---
     with tab2:
