@@ -220,10 +220,12 @@ def run_simulation(df, params):
         # Monthly Contribution
         if curr_date.month != last_month_processed:
             if monthly_investment > 0 and i > 0:
+                # Strategy
                 wallet += monthly_investment
                 portfolio_cash_flows.append((curr_date, -monthly_investment))
                 total_invested_capital += monthly_investment
                 
+                # B&H
                 bh_wallet += monthly_investment
                 bh_cash_flows.append((curr_date, -monthly_investment))
                 new_shares = bh_wallet / curr_close
@@ -246,10 +248,12 @@ def run_simulation(df, params):
         if enable_dividends:
             today_div_amount = df.loc[i, 'Dividends']
             if today_div_amount > 0:
+                # Strategy
                 if current_total_shares > 0:
                     payout = current_total_shares * today_div_amount
                     wallet += payout
                     total_dividends_earned += payout
+                # B&H
                 if bh_shares > 0:
                     bh_payout = bh_shares * today_div_amount
                     bh_wallet += bh_payout
@@ -258,6 +262,7 @@ def run_simulation(df, params):
         if curr_date in trades_by_date:
             day_activity = trades_by_date[curr_date]
             
+            # Sells
             for t in day_activity['sells']:
                 if t['trade_id'] in active_holdings:
                     qty_held = t['quantity']
@@ -267,6 +272,7 @@ def run_simulation(df, params):
                     current_total_shares -= qty_held
                     trade_cash_flows.append((curr_date, revenue))
             
+            # Buys
             for t in day_activity['buys']:
                 qty_to_buy = 0.0
                 cost = 0.0
@@ -309,11 +315,15 @@ def run_simulation(df, params):
         daily_open_value = current_total_shares * curr_close
         daily_total_value = wallet + daily_open_value
         
+        # Track B&H Value
+        daily_bh_value = (bh_shares * curr_close) + bh_wallet
+        
         daily_history.append({
             "Date": curr_date,
             "Total Value": daily_total_value,
             "Cash": wallet,
-            "Open Positions": daily_open_value
+            "Open Positions": daily_open_value,
+            "Buy & Hold": daily_bh_value
         })
         
         prev_sim_date = curr_date
@@ -355,7 +365,7 @@ def run_simulation(df, params):
         "decisions": trade_decisions,
         "dividend_events": dividend_events,
         "bh_final_value": final_bh_value,
-        "daily_history": daily_history # Added this
+        "daily_history": daily_history
     }
 
 # --- Main App ---
@@ -505,7 +515,7 @@ if st.session_state['stock_data'] is not None:
             hist_df = pd.DataFrame(res['daily_history'])
             
             # Melt for Multi-Line Chart (Long Format)
-            chart_df = hist_df.melt(id_vars='Date', value_vars=['Total Value', 'Cash', 'Open Positions'], 
+            chart_df = hist_df.melt(id_vars='Date', value_vars=['Total Value', 'Buy & Hold', 'Cash', 'Open Positions'], 
                                     var_name='Metric', value_name='Value')
             
             # Create Chart
