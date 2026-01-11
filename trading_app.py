@@ -248,12 +248,10 @@ def run_simulation(df, params):
         if enable_dividends:
             today_div_amount = df.loc[i, 'Dividends']
             if today_div_amount > 0:
-                # Strategy
                 if current_total_shares > 0:
                     payout = current_total_shares * today_div_amount
                     wallet += payout
                     total_dividends_earned += payout
-                # B&H
                 if bh_shares > 0:
                     bh_payout = bh_shares * today_div_amount
                     bh_wallet += bh_payout
@@ -373,6 +371,10 @@ if 'stock_data' not in st.session_state:
     st.session_state['stock_data'] = None
 if 'stock_info' not in st.session_state:
     st.session_state['stock_info'] = {}
+    
+# Initialize Results in Session State to fix disappearance
+if 'sim_results' not in st.session_state:
+    st.session_state['sim_results'] = None
 
 # --- Sidebar ---
 with st.sidebar:
@@ -460,8 +462,14 @@ if st.session_state['stock_data'] is not None:
 
     # --- TAB 1: SINGLE RUN ---
     with tab1:
+        # BUTTON LOGIC: Update Session State
         if st.button("Run Single Backtest"):
             res = run_simulation(df, current_params)
+            st.session_state['sim_results'] = res
+        
+        # DISPLAY LOGIC: Check Session State
+        if st.session_state['sim_results'] is not None:
+            res = st.session_state['sim_results']
             
             # Metrics
             c1, c2, c3, c4 = st.columns(4)
@@ -506,28 +514,18 @@ if st.session_state['stock_data'] is not None:
                 })
             st.dataframe(pd.DataFrame(logs), use_container_width=True)
             
-            # --- NEW CHART SECTION (UPDATED with Toggle) ---
+            # --- CHART ---
             st.subheader("📈 Portfolio Growth Over Time")
-            
-            # Prepare Data for Chart
             hist_df = pd.DataFrame(res['daily_history'])
             
-            # 1. Melt for Multi-Line Chart
             all_metrics = ['Total Value', 'Buy & Hold', 'Cash', 'Open Positions']
             chart_df = hist_df.melt(id_vars='Date', value_vars=all_metrics, 
                                     var_name='Metric', value_name='Value')
             
-            # 2. Add Multiselect for Toggling
-            selected_metrics = st.multiselect(
-                "Select Metrics to Display:",
-                options=all_metrics,
-                default=all_metrics
-            )
+            selected_metrics = st.multiselect("Select Metrics:", options=all_metrics, default=all_metrics)
             
-            # 3. Filter Data
-            filtered_chart_df = chart_df[chart_df['Metric'].isin(selected_metrics)]
-            
-            if not filtered_chart_df.empty:
+            if selected_metrics:
+                filtered_chart_df = chart_df[chart_df['Metric'].isin(selected_metrics)]
                 chart = alt.Chart(filtered_chart_df).mark_line().encode(
                     x='Date:T',
                     y=alt.Y('Value:Q', title=f'Value ({currency_symbol})'),
@@ -535,8 +533,6 @@ if st.session_state['stock_data'] is not None:
                     tooltip=['Date', 'Metric', 'Value']
                 ).properties(height=400).interactive()
                 st.altair_chart(chart, use_container_width=True)
-            else:
-                st.warning("Select at least one metric to view the chart.")
 
     # --- TAB 2: OPTIMIZER ---
     with tab2:
