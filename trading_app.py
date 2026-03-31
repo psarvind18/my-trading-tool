@@ -133,6 +133,10 @@ def run_simulation(df_raw, params):
             
             drop_level = 1
             while True:
+                # INFINITE LOOP BREAKER
+                if buy_drop_pct <= 0:
+                    break
+                    
                 current_drop_pct = buy_drop_pct * drop_level
                 target_buy_price = prev_close * (1 - (current_drop_pct / 100.0))
                 
@@ -212,6 +216,10 @@ def run_simulation(df_raw, params):
                     
                     drop_level = 1
                     while True:
+                        # INFINITE LOOP BREAKER
+                        if buy_drop_pct <= 0:
+                            break
+                            
                         current_drop_pct = buy_drop_pct * drop_level
                         target_buy_price = prev_close * (1 - (current_drop_pct / 100.0))
                         
@@ -399,4 +407,52 @@ def run_simulation(df_raw, params):
                         missed_count += 1
                 else: 
                     target_spend = max_trade_amt
-                    possible_spend = min
+                    possible_spend = min(wallet, target_spend)
+                    
+                    if possible_spend >= min_trade_amt:
+                        cost = possible_spend
+                        qty_to_buy = cost / t['buy_price']
+                        wallet -= cost
+                        t['quantity'] = qty_to_buy
+                        active_holdings.add(t['trade_id'])
+                        current_total_shares += qty_to_buy
+                        trade_decisions[t['trade_id']] = "Executed"
+                        executed_count += 1
+                        trade_cash_flows.append((curr_date, -cost))
+                    else:
+                        trade_decisions[t['trade_id']] = "Missed"
+                        missed_count += 1
+        
+        daily_open_value = current_total_shares * curr_close
+        daily_total_value = wallet + daily_open_value
+        daily_bh_value = (bh_shares * curr_close) + bh_wallet
+        
+        daily_history.append({
+            "Date": curr_date,
+            "Total Value": daily_total_value,
+            "Cash": wallet,
+            "Open Positions": daily_open_value,
+            "Buy & Hold": daily_bh_value
+        })
+        
+        prev_sim_date = curr_date
+
+    # --- 4. Valuation ---
+    last_close_price = df.iloc[-1]['Close']
+    final_date = df.iloc[-1]['Date']
+    
+    open_position_value = 0
+    for t in potential_trades:
+        if trade_decisions.get(t['trade_id']) == "Executed" and t['status'] == "Open":
+            val = last_close_price * t['quantity']
+            open_position_value += val
+            trade_cash_flows.append((final_date, val))
+
+    final_strategy_value = wallet + open_position_value
+    portfolio_cash_flows.append((final_date, final_strategy_value))
+    
+    final_bh_value = (bh_shares * last_close_price) + bh_wallet
+    bh_cash_flows.append((final_date, final_bh_value))
+
+    # --- Metrics ---
+    strategy_xirr = xirr(portfolio_cash_flows)
