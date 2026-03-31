@@ -572,8 +572,9 @@ try:
     with st.sidebar:
         st.header("1. Data Loading")
         ticker_symbol = st.text_input("Ticker Symbol", value="VOO").upper()
-        start_input = st.date_input("Start Date", value=date.today().replace(year=date.today().year - 2))
-        end_input = st.date_input("End Date", value=date.today())
+        # Explicitly set min_value so users can go back to at least 1990
+        start_input = st.date_input("Start Date", value=date.today().replace(year=date.today().year - 2), min_value=date(1990, 1, 1))
+        end_input = st.date_input("End Date", value=date.today(), min_value=date(1990, 1, 1))
         
         if st.button("Step 1: Fetch Data"):
             with st.spinner(f"Downloading {ticker_symbol}..."):
