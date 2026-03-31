@@ -6,10 +6,12 @@ import numpy as np
 from datetime import date
 import traceback
 
+# Unlock Altair's row limit so lines don't disappear on multi-year backtests
+alt.data_transformers.disable_max_rows()
+
 # --- Configuration ---
 st.set_page_config(page_title="Algorithmic Strategy Optimizer", layout="wide")
 
-# Wrap the entire app in a try-except to prevent silent "Blank Page" crashes
 try:
     # --- Helper Functions ---
     def fetch_data_from_yahoo(ticker_symbol, start_date, end_date):
@@ -123,7 +125,7 @@ try:
                 
                 drop_level = 1
                 while True:
-                    if buy_drop_pct <= 0: break # Infinite loop safety
+                    if buy_drop_pct <= 0: break
                         
                     current_drop_pct = buy_drop_pct * drop_level
                     target_buy_price = prev_close * (1 - (current_drop_pct / 100.0))
@@ -203,7 +205,7 @@ try:
                         
                         drop_level = 1
                         while True:
-                            if buy_drop_pct <= 0: break # Infinite loop safety
+                            if buy_drop_pct <= 0: break
                                 
                             current_drop_pct = buy_drop_pct * drop_level
                             target_buy_price = prev_close * (1 - (current_drop_pct / 100.0))
@@ -642,56 +644,65 @@ try:
                 
                 st.subheader("📈 Portfolio Growth Over Time")
                 
+                # Format the data cleanly for Altair
                 hist_df = pd.DataFrame(res['daily_history'])
                 hist_df.rename(columns={"Total Value": "Selected Strategy"}, inplace=True)
                 
-                base_df = pd.DataFrame(res_base['daily_history'])[['Date', 'Total Value']]
+                base_df = pd.DataFrame(res_base['daily_history'])[['Date', 'Total Value']].copy()
                 base_df.rename(columns={"Total Value": "Baseline (Dip Accum.)"}, inplace=True)
                 
                 chart_df = pd.merge(hist_df, base_df, on="Date")
                 
+                # Force datetime format so Altair can parse it strictly
+                chart_df['Date'] = pd.to_datetime(chart_df['Date'])
+                
                 all_metrics = ['Selected Strategy', 'Baseline (Dip Accum.)', 'Buy & Hold', 'Cash', 'Open Positions']
-                chart_data_melted = chart_df.melt(id_vars='Date', value_vars=all_metrics, 
-                                        var_name='Metric', value_name='Value')
+                chart_data_melted = chart_df.melt(id_vars='Date', value_vars=all_metrics, var_name='Metric', value_name='Value')
                 
                 selected_metrics = st.multiselect("Select Metrics:", options=all_metrics, default=all_metrics[:3])
                 
                 if selected_metrics:
                     filtered_chart_df = chart_data_melted[chart_data_melted['Metric'].isin(selected_metrics)]
+                    
+                    # Create the base line chart
                     chart = alt.Chart(filtered_chart_df).mark_line().encode(
-                        x='Date:T',
+                        x=alt.X('Date:T', title='Date'),
                         y=alt.Y('Value:Q', title=f'Value ({currency_symbol})'),
-                        color='Metric:N',
-                        tooltip=['Date', 'Metric', 'Value']
+                        color=alt.Color('Metric:N', legend=alt.Legend(title="Metrics")),
+                        tooltip=[alt.Tooltip('Date:T', format='%Y-%m-%d'), 'Metric:N', alt.Tooltip('Value:Q', format=',.2f')]
                     )
                     
+                    # Create the marker dots
                     marker_data = []
                     val_lookup = hist_df.set_index('Date')['Selected Strategy'].to_dict()
                     
                     for t in res['trades']:
                         if res['decisions'].get(t['trade_id']) == "Executed":
-                            buy_d = t['buy_date']
+                            buy_d = pd.to_datetime(t['buy_date'])
                             if buy_d in val_lookup:
                                 marker_data.append({"Date": buy_d, "Action": "Buy", "Value": val_lookup[buy_d], "Stock Price": t['buy_price']})
                             
                             if t['status'] == "Closed":
-                                sell_d = t['sell_date']
+                                sell_d = pd.to_datetime(t['sell_date'])
                                 if pd.notnull(sell_d) and sell_d in val_lookup:
                                     marker_data.append({"Date": sell_d, "Action": "Sell", "Value": val_lookup[sell_d], "Stock Price": t['sell_price']})
                     
+                    # Layer markers on top of lines if any exist
                     if marker_data and 'Selected Strategy' in selected_metrics:
                         markers_df = pd.DataFrame(marker_data)
                         markers = alt.Chart(markers_df).mark_circle(size=80, opacity=1).encode(
-                            x='Date:T',
-                            y='Value:Q',
+                            x=alt.X('Date:T'),
+                            y=alt.Y('Value:Q'),
                             color=alt.Color('Action:N', scale=alt.Scale(domain=['Buy', 'Sell'], range=['#00b050', '#ff0000']), legend=None),
-                            tooltip=['Date', 'Action', 'Stock Price', 'Value']
+                            tooltip=[alt.Tooltip('Date:T', format='%Y-%m-%d'), 'Action:N', alt.Tooltip('Stock Price:Q', format=',.2f'), alt.Tooltip('Value:Q', format=',.2f')]
                         )
-                        final_chart = (chart + markers).properties(height=400).interactive()
+                        final_chart = alt.layer(chart, markers).resolve_scale(color='independent').properties(height=400).interactive()
                     else:
                         final_chart = chart.properties(height=400).interactive()
                     
                     st.altair_chart(final_chart, use_container_width=True)
+                else:
+                    st.warning("Please select at least one metric to display the chart.")
 
         with tab2:
             st.write("Automatically test different parameters to find the 'Sweet Spot'.")
