@@ -123,4 +123,280 @@ def run_simulation(df_raw, params):
         
         if i in restricted_indices: continue 
         
-        # --- STRATEGY LOGIC
+        # --- STRATEGY LOGIC ---
+        buy_price = 0.0
+        
+        # 1. SWING / DIP LOGIC (Original)
+        if strategy_mode in ["Swing Trading", "Dip Accumulation"]:
+            prev_close = df.loc[i-1, 'Close']
+            daily_low = df.loc[i, 'Low']
+            
+            drop_level = 1
+            while True:
+                current_drop_pct = buy_drop_pct * drop_level
+                target_buy_price = prev_close * (1 - (current_drop_pct / 100.0))
+                
+                if daily_low <= target_buy_price:
+                    buy_price = target_buy_price
+                    sell_date = pd.NaT
+                    sell_price = 0.0
+                    status = "Open"
+                    
+                    if strategy_mode == "Swing Trading":
+                        target_activation_price = buy_price * (1 + (sell_profit_pct / 100.0))
+                        
+                        if not use_trailing_stop:
+                            for j in range(i + 1, len(df)):
+                                if j in restricted_indices: continue
+                                if df.loc[j, 'High'] >= target_activation_price:
+                                    sell_date = df.loc[j, 'Date']
+                                    sell_price = target_activation_price
+                                    status = "Closed"
+                                    break
+                        else:
+                            trailing_active = False
+                            peak_price = 0.0
+                            for j in range(i + 1, len(df)):
+                                if j in restricted_indices: continue
+                                day_high = df.loc[j, 'High']
+                                day_low = df.loc[j, 'Low']
+                                if not trailing_active:
+                                    if day_high >= target_activation_price:
+                                        trailing_active = True
+                                        peak_price = day_high
+                                        calc_stop = peak_price * (1 - (trailing_stop_pct / 100.0))
+                                        current_stop = max(calc_stop, target_activation_price)
+                                        if day_low <= current_stop:
+                                            sell_date = df.loc[j, 'Date']
+                                            sell_price = current_stop
+                                            status = "Closed"
+                                            break
+                                else:
+                                    if day_high > peak_price: peak_price = day_high
+                                    calc_stop = peak_price * (1 - (trailing_stop_pct / 100.0))
+                                    current_stop = max(calc_stop, target_activation_price)
+                                    if day_low <= current_stop:
+                                        sell_date = df.loc[j, 'Date']
+                                        sell_price = current_stop
+                                        status = "Closed"
+                                        break
+                    
+                    trade_obj = {
+                        "trade_id": len(potential_trades), "buy_date": daily_date,
+                        "buy_price": buy_price, "drop_pct": f"{round(current_drop_pct, 2)}%",
+                        "sell_date": sell_date, "sell_price": sell_price,
+                        "status": status, "quantity": 0.0
+                    }
+                    potential_trades.append(trade_obj)
+                    trades_by_date[daily_date]['buys'].append(trade_obj)
+                    if status == "Closed":
+                        if sell_date not in trades_by_date: trades_by_date[sell_date] = {'buys': [], 'sells': []}
+                        trades_by_date[sell_date]['sells'].append(trade_obj)
+                    
+                    drop_level += 1
+                else:
+                    break
+
+        # 2. TREND-FILTERED DIP LOGIC
+        elif strategy_mode == "Trend-Filtered Dip":
+            if pd.notnull(df.loc[i-1, 'SMA_Trend']):
+                is_healthy = True
+                for k in range(1, confirmation_days + 1):
+                    if (i-k) < 0 or pd.isnull(df.loc[i-k, 'SMA_Trend']) or df.loc[i-k, 'Close'] <= df.loc[i-k, 'SMA_Trend']:
+                        is_healthy = False
+                        break
+                
+                if is_healthy:
+                    prev_close = df.loc[i-1, 'Close']
+                    daily_low = df.loc[i, 'Low']
+                    
+                    drop_level = 1
+                    while True:
+                        current_drop_pct = buy_drop_pct * drop_level
+                        target_buy_price = prev_close * (1 - (current_drop_pct / 100.0))
+                        
+                        if daily_low <= target_buy_price:
+                            buy_price = target_buy_price
+                            sell_date = pd.NaT
+                            sell_price = 0.0
+                            status = "Open"
+                            
+                            for j in range(i + 1, len(df)):
+                                if df.loc[j, 'Close'] < df.loc[j, 'SMA_Trend']:
+                                    sell_date = df.loc[j, 'Date']
+                                    sell_price = df.loc[j, 'Close']
+                                    status = "Closed"
+                                    break
+                            
+                            trade_obj = {
+                                "trade_id": len(potential_trades), "buy_date": daily_date,
+                                "buy_price": buy_price, "drop_pct": f"{round(current_drop_pct, 2)}%",
+                                "sell_date": sell_date, "sell_price": sell_price,
+                                "status": status, "quantity": 0.0
+                            }
+                            potential_trades.append(trade_obj)
+                            trades_by_date[daily_date]['buys'].append(trade_obj)
+                            if status == "Closed":
+                                if sell_date not in trades_by_date: trades_by_date[sell_date] = {'buys': [], 'sells': []}
+                                trades_by_date[sell_date]['sells'].append(trade_obj)
+                            
+                            drop_level += 1
+                        else:
+                            break
+
+        # 3. SMA CROSSOVER LOGIC
+        elif strategy_mode == "SMA Crossover":
+            if pd.notnull(df.loc[i, 'SMA_S']) and pd.notnull(df.loc[i, 'SMA_L']):
+                if df.loc[i-1, 'SMA_S'] < df.loc[i-1, 'SMA_L'] and df.loc[i, 'SMA_S'] > df.loc[i, 'SMA_L']:
+                    buy_price = df.loc[i, 'Close']
+                    sell_date = pd.NaT
+                    sell_price = 0.0
+                    status = "Open"
+                    for j in range(i + 1, len(df)):
+                        if pd.notnull(df.loc[j, 'SMA_S']) and pd.notnull(df.loc[j, 'SMA_L']):
+                            if df.loc[j-1, 'SMA_S'] > df.loc[j-1, 'SMA_L'] and df.loc[j, 'SMA_S'] < df.loc[j, 'SMA_L']:
+                                sell_date = df.loc[j, 'Date']
+                                sell_price = df.loc[j, 'Close']
+                                status = "Closed"
+                                break
+                    trade_obj = {
+                        "trade_id": len(potential_trades), "buy_date": daily_date,
+                        "buy_price": buy_price, "drop_pct": "SMA Cross",
+                        "sell_date": sell_date, "sell_price": sell_price,
+                        "status": status, "quantity": 0.0
+                    }
+                    potential_trades.append(trade_obj)
+                    trades_by_date[daily_date]['buys'].append(trade_obj)
+                    if status == "Closed":
+                        if sell_date not in trades_by_date: trades_by_date[sell_date] = {'buys': [], 'sells': []}
+                        trades_by_date[sell_date]['sells'].append(trade_obj)
+
+        # 4. RSI MEAN REVERSION LOGIC
+        elif strategy_mode == "RSI Mean Reversion":
+            if pd.notnull(df.loc[i, 'RSI']):
+                if df.loc[i, 'RSI'] < rsi_buy:
+                    buy_price = df.loc[i, 'Close']
+                    sell_date = pd.NaT
+                    sell_price = 0.0
+                    status = "Open"
+                    for j in range(i + 1, len(df)):
+                        if pd.notnull(df.loc[j, 'RSI']):
+                            if df.loc[j, 'RSI'] > rsi_sell:
+                                sell_date = df.loc[j, 'Date']
+                                sell_price = df.loc[j, 'Close']
+                                status = "Closed"
+                                break
+                    trade_obj = {
+                        "trade_id": len(potential_trades), "buy_date": daily_date,
+                        "buy_price": buy_price, "drop_pct": f"RSI {round(df.loc[i, 'RSI'],1)}",
+                        "sell_date": sell_date, "sell_price": sell_price,
+                        "status": status, "quantity": 0.0
+                    }
+                    potential_trades.append(trade_obj)
+                    trades_by_date[daily_date]['buys'].append(trade_obj)
+                    if status == "Closed":
+                        if sell_date not in trades_by_date: trades_by_date[sell_date] = {'buys': [], 'sells': []}
+                        trades_by_date[sell_date]['sells'].append(trade_obj)
+
+    # --- 2. Simulation (Shared Logic) ---
+    wallet = initial_investment
+    active_holdings = set() # trade_ids
+    trade_decisions = {}
+    trade_cash_flows = [] 
+    portfolio_cash_flows = [ (df.iloc[0]['Date'], -initial_investment) ]
+    
+    total_interest_earned = 0.0
+    total_dividends_earned = 0.0
+    total_invested_capital = initial_investment
+    
+    executed_count = 0
+    missed_count = 0
+    current_total_shares = 0.0
+    daily_history = []
+    
+    # B&H Benchmarking
+    bh_shares = 0.0
+    bh_wallet = initial_investment
+    bh_cash_flows = [ (df.iloc[0]['Date'], -initial_investment) ]
+    first_open_price = df.iloc[0]['Open'] 
+    
+    start_shares = bh_wallet / first_open_price
+    bh_shares += start_shares
+    bh_wallet = 0.0
+
+    prev_sim_date = df.iloc[0]['Date']
+    last_month_processed = -1
+    
+    for i in range(len(df)):
+        curr_date = df.iloc[i]['Date']
+        curr_close = df.iloc[i]['Close']
+        
+        if curr_date.month != last_month_processed:
+            if monthly_investment > 0 and i > 0:
+                wallet += monthly_investment
+                portfolio_cash_flows.append((curr_date, -monthly_investment))
+                total_invested_capital += monthly_investment
+                
+                bh_wallet += monthly_investment
+                bh_cash_flows.append((curr_date, -monthly_investment))
+                new_shares = bh_wallet / curr_close
+                bh_shares += new_shares
+                bh_wallet = 0.0
+            last_month_processed = curr_date.month
+
+        days_delta = (curr_date - prev_sim_date).days
+        if days_delta > 0:
+            if wallet > 0:
+                interest = wallet * (interest_rate_pct / 100.0 / 365.0) * days_delta
+                wallet += interest
+                total_interest_earned += interest
+            if bh_wallet > 0:
+                bh_interest = bh_wallet * (interest_rate_pct / 100.0 / 365.0) * days_delta
+                bh_wallet += bh_interest
+
+        if enable_dividends:
+            today_div_amount = df.loc[i, 'Dividends']
+            if today_div_amount > 0:
+                if current_total_shares > 0:
+                    payout = current_total_shares * today_div_amount
+                    wallet += payout
+                    total_dividends_earned += payout
+                if bh_shares > 0:
+                    bh_payout = bh_shares * today_div_amount
+                    bh_wallet += bh_payout
+
+        if curr_date in trades_by_date:
+            day_activity = trades_by_date[curr_date]
+            
+            for t in day_activity['sells']:
+                if t['trade_id'] in active_holdings:
+                    qty_held = t['quantity']
+                    revenue = t['sell_price'] * qty_held
+                    wallet += revenue
+                    active_holdings.remove(t['trade_id'])
+                    current_total_shares -= qty_held
+                    trade_cash_flows.append((curr_date, revenue))
+            
+            for t in day_activity['buys']:
+                if t['trade_id'] in trade_decisions: continue
+                qty_to_buy = 0.0
+                cost = 0.0
+                
+                if trade_size_type == "Fixed Shares":
+                    qty_to_buy = float(shares_per_trade)
+                    cost = qty_to_buy * t['buy_price']
+                    
+                    if wallet >= cost:
+                        wallet -= cost
+                        t['quantity'] = qty_to_buy
+                        active_holdings.add(t['trade_id'])
+                        current_total_shares += qty_to_buy
+                        trade_decisions[t['trade_id']] = "Executed"
+                        executed_count += 1
+                        trade_cash_flows.append((curr_date, -cost))
+                    else:
+                        trade_decisions[t['trade_id']] = "Missed"
+                        missed_count += 1
+                else: 
+                    target_spend = max_trade_amt
+                    possible_spend = min
