@@ -199,17 +199,13 @@ def run_simulation(df_raw, params):
 
         # 2. TREND-FILTERED DIP LOGIC
         elif strategy_mode == "Trend-Filtered Dip":
-            # Wait until moving average exists
             if pd.notnull(df.loc[i-1, 'SMA_Trend']):
-                
-                # Check for N-Day Confirmation (Has price been above MA for X days?)
                 is_healthy = True
                 for k in range(1, confirmation_days + 1):
                     if (i-k) < 0 or pd.isnull(df.loc[i-k, 'SMA_Trend']) or df.loc[i-k, 'Close'] <= df.loc[i-k, 'SMA_Trend']:
                         is_healthy = False
                         break
                 
-                # Only buy dips if the market regime is "Healthy"
                 if is_healthy:
                     prev_close = df.loc[i-1, 'Close']
                     daily_low = df.loc[i, 'Low']
@@ -225,7 +221,6 @@ def run_simulation(df_raw, params):
                             sell_price = 0.0
                             status = "Open"
                             
-                            # Sell Trigger: Exit when daily close falls below the SMA Trend line
                             for j in range(i + 1, len(df)):
                                 if df.loc[j, 'Close'] < df.loc[j, 'SMA_Trend']:
                                     sell_date = df.loc[j, 'Date']
@@ -484,6 +479,8 @@ if 'stock_info' not in st.session_state:
     
 if 'sim_results' not in st.session_state:
     st.session_state['sim_results'] = None
+if 'baseline_results' not in st.session_state:
+    st.session_state['baseline_results'] = None
 
 # --- Sidebar ---
 with st.sidebar:
@@ -544,13 +541,18 @@ with st.sidebar:
         rsi_sell = st.number_input("RSI Sell Level (Overbought)", value=70, step=5)
 
     st.divider()
-    st.header("3. Financials")
+    st.header("3. Baseline Comparison")
+    st.info("Dip Accumulation is always calculated as a baseline.")
+    baseline_buy_drop_pct = st.number_input("Baseline Buy Drop (%)", value=1.0, step=0.1)
+
+    st.divider()
+    st.header("4. Financials")
     interest_rate_pct = st.number_input("Cash Interest (%)", value=3.75, step=0.25, format="%.2f")
     enable_dividends = st.checkbox("Include Dividends", True)
     restrict_ex_date = st.checkbox("Restrict Ex-Date", True) if enable_dividends else False
     
     st.divider()
-    st.header("4. Wallet & Sizing")
+    st.header("5. Wallet & Sizing")
     currency_symbol = st.text_input("Currency", "$")
     initial_investment = st.number_input("Initial Inv.", value=1000.0, step=500.0)
     monthly_investment = st.number_input("Monthly Contrib.", value=0.0, step=100.0)
@@ -601,23 +603,33 @@ if st.session_state['stock_data'] is not None:
     # --- TAB 1: SINGLE RUN ---
     with tab1:
         if st.button("Run Single Backtest"):
+            # 1. Run Selected Strategy
             res = run_simulation(df, current_params)
             st.session_state['sim_results'] = res
+            
+            # 2. Run Baseline Strategy
+            baseline_params = current_params.copy()
+            baseline_params['strategy_mode'] = "Dip Accumulation"
+            baseline_params['buy_drop_pct'] = baseline_buy_drop_pct
+            res_base = run_simulation(df, baseline_params)
+            st.session_state['baseline_results'] = res_base
         
-        if st.session_state['sim_results'] is not None:
+        if st.session_state['sim_results'] is not None and st.session_state['baseline_results'] is not None:
             res = st.session_state['sim_results']
+            res_base = st.session_state['baseline_results']
             
-            c1, c2, c3, c4 = st.columns(4)
+            c1, c2, c3, c4, c5 = st.columns(5)
             c1.metric("Final Value", f"{currency_symbol}{res['final_value']:,.2f}", delta=f"Inv: {currency_symbol}{res['invested_capital']:,.0f}")
-            c2.metric("Strategy XIRR", f"{res['strategy_xirr']:.2%}")
-            c3.metric("Buy & Hold XIRR", f"{res['bh_xirr']:.2%}")
-            c4.metric("Trade Efficiency", f"{res['trade_xirr']:.2%}")
+            c2.metric("Selected Strategy XIRR", f"{res['strategy_xirr']:.2%}")
+            c3.metric("Baseline Dip XIRR", f"{res_base['strategy_xirr']:.2%}")
+            c4.metric("Buy & Hold XIRR", f"{res['bh_xirr']:.2%}")
+            c5.metric("Trade Efficiency", f"{res['trade_xirr']:.2%}")
             
-            c5, c6, c7, c8 = st.columns(4)
-            c5.metric("Trades", f"{res['executed_trades']} / {res['executed_trades'] + res['missed_trades']}")
-            c6.metric("Passive Income", f"{currency_symbol}{res['passive_income']:,.2f}")
-            c7.metric("Cash Balance", f"{currency_symbol}{res['wallet_cash']:,.2f}")
-            c8.metric("Open Value", f"{currency_symbol}{res['open_value']:,.2f}")
+            c6, c7, c8, c9 = st.columns(4)
+            c6.metric("Trades", f"{res['executed_trades']} / {res['executed_trades'] + res['missed_trades']}")
+            c7.metric("Passive Income", f"{currency_symbol}{res['passive_income']:,.2f}")
+            c8.metric("Cash Balance", f"{currency_symbol}{res['wallet_cash']:,.2f}")
+            c9.metric("Open Value", f"{currency_symbol}{res['open_value']:,.2f}")
 
             if enable_dividends and res['dividend_events']:
                 with st.expander(f"📅 Dividend Schedule ({len(res['dividend_events'])})"):
@@ -648,15 +660,26 @@ if st.session_state['stock_data'] is not None:
             st.dataframe(pd.DataFrame(logs), use_container_width=True)
             
             st.subheader("📈 Portfolio Growth Over Time")
+            
+            # Extract and Rename Strategy History
             hist_df = pd.DataFrame(res['daily_history'])
-            all_metrics = ['Total Value', 'Buy & Hold', 'Cash', 'Open Positions']
-            chart_df = hist_df.melt(id_vars='Date', value_vars=all_metrics, 
+            hist_df.rename(columns={"Total Value": "Selected Strategy"}, inplace=True)
+            
+            # Extract and Rename Baseline History
+            base_df = pd.DataFrame(res_base['daily_history'])[['Date', 'Total Value']]
+            base_df.rename(columns={"Total Value": "Baseline (Dip Accum.)"}, inplace=True)
+            
+            # Merge for Charting
+            chart_df = pd.merge(hist_df, base_df, on="Date")
+            
+            all_metrics = ['Selected Strategy', 'Baseline (Dip Accum.)', 'Buy & Hold', 'Cash', 'Open Positions']
+            chart_data_melted = chart_df.melt(id_vars='Date', value_vars=all_metrics, 
                                     var_name='Metric', value_name='Value')
             
-            selected_metrics = st.multiselect("Select Metrics:", options=all_metrics, default=all_metrics)
+            selected_metrics = st.multiselect("Select Metrics:", options=all_metrics, default=all_metrics[:3])
             
             if selected_metrics:
-                filtered_chart_df = chart_df[chart_df['Metric'].isin(selected_metrics)]
+                filtered_chart_df = chart_data_melted[chart_data_melted['Metric'].isin(selected_metrics)]
                 chart = alt.Chart(filtered_chart_df).mark_line().encode(
                     x='Date:T',
                     y=alt.Y('Value:Q', title=f'Value ({currency_symbol})'),
