@@ -63,6 +63,7 @@ try:
     def run_simulation(df_raw, params):
         df = df_raw.copy()
         
+        # --- Pre-calculate Indicators ---
         if params['strategy_mode'] == "SMA Crossover":
             df['SMA_S'] = df['Close'].rolling(window=params['sma_short']).mean()
             df['SMA_L'] = df['Close'].rolling(window=params['sma_long']).mean()
@@ -74,29 +75,35 @@ try:
             df['RSI'] = 100 - (100 / (1 + rs))
         elif params['strategy_mode'] == "Trend-Filtered Dip":
             df['SMA_Trend'] = df['Close'].rolling(window=params['trend_sma']).mean()
+        elif params['strategy_mode'] == "Bollinger Bands":
+            df['BB_SMA'] = df['Close'].rolling(window=params['bb_window']).mean()
+            df['BB_STD'] = df['Close'].rolling(window=params['bb_window']).std()
+            df['BB_Upper'] = df['BB_SMA'] + (params['bb_std'] * df['BB_STD'])
+            df['BB_Lower'] = df['BB_SMA'] - (params['bb_std'] * df['BB_STD'])
 
         strategy_mode = params['strategy_mode']
         buy_drop_pct = params.get('buy_drop_pct', 0.0)
         sell_profit_pct = params.get('sell_profit_pct', 0.0)
         use_trailing_stop = params.get('use_trailing_stop', False)
         trailing_stop_pct = params.get('trailing_stop_pct', 0.0)
+        
         rsi_buy = params.get('rsi_buy', 30)
         rsi_sell = params.get('rsi_sell', 70)
         trend_sma = params.get('trend_sma', 200)
         confirmation_days = params.get('confirmation_days', 3)
+        bb_window = params.get('bb_window', 50)
+        bb_std = params.get('bb_std', 2.0)
         
         interest_rate_pct = params['interest_rate_pct']
         enable_dividends = params['enable_dividends']
         restrict_ex_date = params['restrict_ex_date']
         
-        # TAX PARAMETERS
         enable_taxes = params.get('enable_taxes', False)
         st_tax_rate = params.get('st_tax_rate', 0.25)
         lt_tax_rate = params.get('lt_tax_rate', 0.15)
         
         initial_investment = params['initial_investment']
         monthly_investment = params['monthly_investment']
-        
         trade_size_type = params['trade_size_type']
         shares_per_trade = params['shares_per_trade']
         min_trade_amt = params['min_trade_amt']
@@ -117,7 +124,7 @@ try:
         potential_trades = []
         trades_by_date = {} 
         
-        # 1. GENERATE SIGNALS
+        # --- 1. GENERATE DAILY SIGNALS ---
         for i in range(1, len(df)):
             daily_date = df.loc[i, 'Date']
             if daily_date not in trades_by_date:
@@ -146,7 +153,6 @@ try:
                         
                         if strategy_mode == "Swing Trading":
                             target_activation_price = buy_price * (1 + (sell_profit_pct / 100.0))
-                            
                             if not use_trailing_stop:
                                 for j in range(i + 1, len(df)):
                                     if j in restricted_indices: continue
@@ -299,6 +305,34 @@ try:
                             if sell_date not in trades_by_date: trades_by_date[sell_date] = {'buys': [], 'sells': []}
                             trades_by_date[sell_date]['sells'].append(trade_obj)
 
+            elif strategy_mode == "Bollinger Bands":
+                if pd.notnull(df.loc[i-1, 'BB_Lower']):
+                    # Buy when price drops below yesterday's Lower Band
+                    if df.loc[i, 'Low'] <= df.loc[i-1, 'BB_Lower']:
+                        buy_price = df.loc[i-1, 'BB_Lower']
+                        sell_date = pd.NaT
+                        sell_price = 0.0
+                        status = "Open"
+                        for j in range(i + 1, len(df)):
+                            if pd.notnull(df.loc[j-1, 'BB_Upper']):
+                                # Sell when price jumps above yesterday's Upper Band
+                                if df.loc[j, 'High'] >= df.loc[j-1, 'BB_Upper']:
+                                    sell_date = df.loc[j, 'Date']
+                                    sell_price = df.loc[j-1, 'BB_Upper']
+                                    status = "Closed"
+                                    break
+                        trade_obj = {
+                            "trade_id": len(potential_trades), "buy_date": daily_date,
+                            "buy_price": buy_price, "drop_pct": "BB Touch",
+                            "sell_date": sell_date, "sell_price": sell_price,
+                            "status": status, "quantity": 0.0
+                        }
+                        potential_trades.append(trade_obj)
+                        trades_by_date[daily_date]['buys'].append(trade_obj)
+                        if status == "Closed":
+                            if sell_date not in trades_by_date: trades_by_date[sell_date] = {'buys': [], 'sells': []}
+                            trades_by_date[sell_date]['sells'].append(trade_obj)
+
 
         # --- 2. SIMULATION EXECUTION ---
         wallet = initial_investment
@@ -307,8 +341,7 @@ try:
         trade_cash_flows = [] 
         portfolio_cash_flows = [ (df.iloc[0]['Date'], -initial_investment) ]
         
-        # TAX TRACKING VARIABLES
-        yearly_realized_gains = {} # Format: {2021: {'st': 500, 'lt': -100}}
+        yearly_realized_gains = {} 
         taxes_paid_years = set()
         total_taxes_paid = 0.0
         tax_events_log = []
@@ -333,6 +366,24 @@ try:
 
         prev_sim_date = df.iloc[0]['Date']
         last_month_processed = -1
+        months_passed = 0
+        
+        # Value Averaging Initialization (Day 1)
+        if strategy_mode == "Value Averaging":
+            qty = initial_investment / first_open_price
+            wallet -= initial_investment
+            current_total_shares += qty
+            t_obj = {
+                "trade_id": 0, "buy_date": df.iloc[0]['Date'],
+                "buy_price": first_open_price, "drop_pct": "VA Init",
+                "sell_date": pd.NaT, "sell_price": 0.0,
+                "status": "Open", "quantity": qty
+            }
+            potential_trades.append(t_obj)
+            trade_decisions[0] = "Executed"
+            active_holdings.add(0)
+            executed_count += 1
+            # Note: portfolio_cash_flows already logged -initial_investment
         
         for i in range(len(df)):
             curr_date = df.iloc[i]['Date']
@@ -347,7 +398,6 @@ try:
                         st_gains = yearly_realized_gains[prev_year]['st']
                         lt_gains = yearly_realized_gains[prev_year]['lt']
                         
-                        # Netting gains and losses
                         tax_bill = 0.0
                         if st_gains >= 0 and lt_gains >= 0:
                             tax_bill = (st_gains * st_tax_rate) + (lt_gains * lt_tax_rate)
@@ -362,7 +412,6 @@ try:
                             if wallet >= tax_bill:
                                 wallet -= tax_bill
                             else:
-                                # FORCED LIQUIDATION to pay taxes
                                 shortfall = tax_bill - wallet
                                 for t_id in list(active_holdings):
                                     t_obj = potential_trades[t_id]
@@ -374,7 +423,6 @@ try:
                                     active_holdings.remove(t_id)
                                     current_total_shares -= qty
                                     
-                                    # Record gain for the CURRENT year from this forced sale
                                     f_profit = revenue - (t_obj['buy_price'] * qty)
                                     f_days = (curr_date - t_obj['buy_date']).days
                                     c_year = curr_date.year
@@ -385,21 +433,22 @@ try:
                                     else:
                                         yearly_realized_gains[c_year]['st'] += f_profit
                                         
-                                    # Update trade log status
                                     t_obj['status'] = "Tax Liquidation"
                                     t_obj['sell_date'] = curr_date
                                     t_obj['sell_price'] = curr_close
                                     
-                                    if shortfall <= 0:
-                                        break
+                                    if shortfall <= 0: break
                                 
-                                wallet -= tax_bill # Deduct the bill after selling enough
+                                wallet -= tax_bill
                             
                             total_taxes_paid += tax_bill
                             tax_events_log.append({"Date": curr_date, "Year Taxed": prev_year, "Amount": tax_bill})
             
-            # Monthly Contributions
+            # --- MONTHLY ACTIONS ---
             if curr_date.month != last_month_processed:
+                if i > 0: months_passed += 1
+                
+                # Standard Contribution
                 if monthly_investment > 0 and i > 0:
                     wallet += monthly_investment
                     portfolio_cash_flows.append((curr_date, -monthly_investment))
@@ -410,6 +459,90 @@ try:
                     new_shares = bh_wallet / curr_close
                     bh_shares += new_shares
                     bh_wallet = 0.0
+                
+                # Value Averaging Specific Monthly Rebalance
+                if strategy_mode == "Value Averaging" and i > 0:
+                    target_value = initial_investment + (months_passed * monthly_investment)
+                    current_holdings_val = current_total_shares * curr_close
+                    diff = target_value - current_holdings_val
+                    
+                    if diff > 0:
+                        # Buy Shares to catch up
+                        spend = min(diff, wallet)
+                        if spend > 0:
+                            qty = spend / curr_close
+                            wallet -= spend
+                            current_total_shares += qty
+                            t_obj = {
+                                "trade_id": len(potential_trades), "buy_date": curr_date,
+                                "buy_price": curr_close, "drop_pct": "VA Buy",
+                                "sell_date": pd.NaT, "sell_price": 0.0,
+                                "status": "Open", "quantity": qty
+                            }
+                            potential_trades.append(t_obj)
+                            trade_decisions[t_obj['trade_id']] = "Executed"
+                            active_holdings.add(t_obj['trade_id'])
+                            executed_count += 1
+                            trade_cash_flows.append((curr_date, -spend))
+                    elif diff < 0:
+                        # Sell Shares to lock in excess profit
+                        target_revenue = min(abs(diff), current_holdings_val)
+                        revenue_collected = 0.0
+                        
+                        sorted_holdings = sorted(list(active_holdings))
+                        for t_id in sorted_holdings:
+                            if revenue_collected >= target_revenue: break
+                            t = potential_trades[t_id]
+                            pos_value = t['quantity'] * curr_close
+                            
+                            if pos_value <= (target_revenue - revenue_collected):
+                                # Liquidate entire lot
+                                wallet += pos_value
+                                revenue_collected += pos_value
+                                current_total_shares -= t['quantity']
+                                active_holdings.remove(t_id)
+                                t['status'] = "VA Sell"
+                                t['sell_date'] = curr_date
+                                t['sell_price'] = curr_close
+                                trade_cash_flows.append((curr_date, pos_value))
+                                
+                                if enable_taxes:
+                                    profit = pos_value - (t['buy_price'] * t['quantity'])
+                                    days_held = (curr_date - t['buy_date']).days
+                                    c_year = curr_date.year
+                                    if c_year not in yearly_realized_gains: yearly_realized_gains[c_year] = {'st': 0.0, 'lt': 0.0}
+                                    if days_held > 365: yearly_realized_gains[c_year]['lt'] += profit
+                                    else: yearly_realized_gains[c_year]['st'] += profit
+                            else:
+                                # Liquidate partial lot
+                                needed_revenue = target_revenue - revenue_collected
+                                qty_to_sell = needed_revenue / curr_close
+                                
+                                wallet += needed_revenue
+                                revenue_collected += needed_revenue
+                                current_total_shares -= qty_to_sell
+                                t['quantity'] -= qty_to_sell
+                                
+                                # Log the partial sell for tracking
+                                sold_obj = {
+                                    "trade_id": len(potential_trades), "buy_date": t['buy_date'],
+                                    "buy_price": t['buy_price'], "drop_pct": "VA Sell",
+                                    "sell_date": curr_date, "sell_price": curr_close,
+                                    "status": "VA Sell", "quantity": qty_to_sell
+                                }
+                                potential_trades.append(sold_obj)
+                                trade_decisions[sold_obj['trade_id']] = "Executed"
+                                trade_cash_flows.append((curr_date, needed_revenue))
+                                
+                                if enable_taxes:
+                                    profit = needed_revenue - (t['buy_price'] * qty_to_sell)
+                                    days_held = (curr_date - t['buy_date']).days
+                                    c_year = curr_date.year
+                                    if c_year not in yearly_realized_gains: yearly_realized_gains[c_year] = {'st': 0.0, 'lt': 0.0}
+                                    if days_held > 365: yearly_realized_gains[c_year]['lt'] += profit
+                                    else: yearly_realized_gains[c_year]['st'] += profit
+                                break
+                            
                 last_month_processed = curr_date.month
 
             # Interest
@@ -435,11 +568,10 @@ try:
                         bh_payout = bh_shares * today_div_amount
                         bh_wallet += bh_payout
 
-            # Trading Execution
-            if curr_date in trades_by_date:
+            # Trading Execution (For non-VA signal-based strategies)
+            if strategy_mode != "Value Averaging" and curr_date in trades_by_date:
                 day_activity = trades_by_date[curr_date]
                 
-                # SELLS
                 for t in day_activity['sells']:
                     if t['trade_id'] in active_holdings:
                         qty_held = t['quantity']
@@ -449,20 +581,14 @@ try:
                         current_total_shares -= qty_held
                         trade_cash_flows.append((curr_date, revenue))
                         
-                        # --- RECORD GAIN FOR TAXES ---
                         if enable_taxes:
                             profit = revenue - (t['buy_price'] * qty_held)
                             days_held = (curr_date - t['buy_date']).days
                             c_year = curr_date.year
-                            
-                            if c_year not in yearly_realized_gains:
-                                yearly_realized_gains[c_year] = {'st': 0.0, 'lt': 0.0}
-                            if days_held > 365:
-                                yearly_realized_gains[c_year]['lt'] += profit
-                            else:
-                                yearly_realized_gains[c_year]['st'] += profit
+                            if c_year not in yearly_realized_gains: yearly_realized_gains[c_year] = {'st': 0.0, 'lt': 0.0}
+                            if days_held > 365: yearly_realized_gains[c_year]['lt'] += profit
+                            else: yearly_realized_gains[c_year]['st'] += profit
                 
-                # BUYS
                 for t in day_activity['buys']:
                     if t['trade_id'] in trade_decisions: continue
                     qty_to_buy = 0.0
@@ -471,7 +597,6 @@ try:
                     if trade_size_type == "Fixed Shares":
                         qty_to_buy = float(shares_per_trade)
                         cost = qty_to_buy * t['buy_price']
-                        
                         if wallet >= cost:
                             wallet -= cost
                             t['quantity'] = qty_to_buy
@@ -486,7 +611,6 @@ try:
                     else: 
                         target_spend = max_trade_amt
                         possible_spend = min(wallet, target_spend)
-                        
                         if possible_spend >= min_trade_amt:
                             cost = possible_spend
                             qty_to_buy = cost / t['buy_price']
@@ -572,7 +696,6 @@ try:
     with st.sidebar:
         st.header("1. Data Loading")
         ticker_symbol = st.text_input("Ticker Symbol", value="VOO").upper()
-        # Explicitly set min_value so users can go back to at least 1990
         start_input = st.date_input("Start Date", value=date.today().replace(year=date.today().year - 2), min_value=date(1990, 1, 1))
         end_input = st.date_input("End Date", value=date.today(), min_value=date(1990, 1, 1))
         
@@ -590,7 +713,10 @@ try:
         st.divider()
         
         st.header("2. Strategy Settings")
-        strategy_mode = st.selectbox("Strategy Type", ["Swing Trading", "Trend-Filtered Dip", "Dip Accumulation", "SMA Crossover", "RSI Mean Reversion"])
+        strategy_mode = st.selectbox("Strategy Type", [
+            "Value Averaging", "Bollinger Bands", "Swing Trading", 
+            "Trend-Filtered Dip", "Dip Accumulation", "SMA Crossover", "RSI Mean Reversion"
+        ])
         
         buy_drop_pct = 0.0
         sell_profit_pct = 0.0
@@ -602,6 +728,8 @@ try:
         rsi_sell = 70
         trend_sma = 200
         confirmation_days = 3
+        bb_window = 50
+        bb_std = 2.0
 
         if strategy_mode in ["Swing Trading", "Dip Accumulation", "Trend-Filtered Dip"]:
             buy_drop_pct = st.number_input("Buy Drop Step (%)", value=1.0, step=0.1)
@@ -617,6 +745,14 @@ try:
                 if use_trailing_stop:
                     trailing_stop_pct = st.number_input("Trailing Stop (%) (Base Value)", value=2.0, step=0.1)
         
+        elif strategy_mode == "Value Averaging":
+            st.info("Dynamically buys and sells shares to force the portfolio value to increase by exactly your 'Monthly Contribution' amount every month.")
+
+        elif strategy_mode == "Bollinger Bands":
+            st.info("Buys when price touches the Lower Band. Sells when price touches the Upper Band.")
+            bb_window = st.number_input("BB Window (Days)", value=50, step=5)
+            bb_std = st.number_input("Standard Deviations", value=2.0, step=0.1)
+
         elif strategy_mode == "SMA Crossover":
             st.info("Buys when Short SMA crosses ABOVE Long SMA. Sells when Short crosses BELOW.")
             sma_short = st.number_input("Short SMA (Days)", value=50, step=5)
@@ -652,9 +788,9 @@ try:
         st.header("5. Wallet & Sizing")
         currency_symbol = st.text_input("Currency", "$")
         initial_investment = st.number_input("Initial Inv.", value=1000.0, step=500.0)
-        monthly_investment = st.number_input("Monthly Contrib.", value=0.0, step=100.0)
+        monthly_investment = st.number_input("Monthly Contrib.", value=500.0, step=100.0)
         
-        trade_size_type = st.selectbox("Trade Size Type", ["Fixed Shares", "Dollar Amount"])
+        trade_size_type = st.selectbox("Trade Size Type", ["Dollar Amount", "Fixed Shares"])
         shares_per_trade = 1
         min_trade_amt = 0.0
         max_trade_amt = 0.0
@@ -683,6 +819,8 @@ try:
             'rsi_sell': rsi_sell,
             'trend_sma': trend_sma,
             'confirmation_days': confirmation_days,
+            'bb_window': bb_window,
+            'bb_std': bb_std,
             'interest_rate_pct': interest_rate_pct,
             'enable_dividends': enable_dividends,
             'restrict_ex_date': restrict_ex_date,
@@ -743,17 +881,17 @@ try:
                     qty = t['quantity']
                     
                     if decision == "Executed":
-                        s_price = t['sell_price'] if t.get('status') in ["Closed", "Tax Liquidation"] else last_close
+                        s_price = t['sell_price'] if t.get('status') in ["Closed", "VA Sell", "Tax Liquidation"] else last_close
                         p_share = s_price - t['buy_price']
                     
                     logs.append({
-                        "Date": t['buy_date'].strftime('%Y-%m-%d'),
+                        "Date": t['buy_date'].strftime('%Y-%m-%d') if pd.notnull(t['buy_date']) else "-",
                         "Buy": f"{currency_symbol}{t['buy_price']:.2f}",
                         "Sell": f"{currency_symbol}{s_price:.2f}" if decision == "Executed" else "-",
                         "Qty": f"{qty:.4f}" if decision == "Executed" else "-",
                         "Profit": f"{currency_symbol}{p_share * qty:.2f}" if decision == "Executed" else "-",
                         "Status": t.get('status', 'Unknown'),
-                        "Drop/Signal": t['drop_pct']
+                        "Drop/Signal": t.get('drop_pct', '')
                     })
                 st.dataframe(pd.DataFrame(logs), use_container_width=True)
                 
@@ -792,7 +930,7 @@ try:
                             if buy_d in val_lookup:
                                 marker_data.append({"Date": buy_d, "Action": "Buy", "Value": val_lookup[buy_d], "Stock Price": t['buy_price']})
                             
-                            if t.get('status') in ["Closed", "Tax Liquidation"]:
+                            if t.get('status') in ["Closed", "VA Sell", "Tax Liquidation"]:
                                 sell_d = pd.to_datetime(t['sell_date'])
                                 if pd.notnull(sell_d) and sell_d in val_lookup:
                                     marker_data.append({"Date": sell_d, "Action": t.get('status'), "Value": val_lookup[sell_d], "Stock Price": t['sell_price']})
@@ -802,7 +940,7 @@ try:
                         markers = alt.Chart(markers_df).mark_circle(size=80, opacity=1).encode(
                             x=alt.X('Date:T'),
                             y=alt.Y('Value:Q'),
-                            color=alt.Color('Action:N', scale=alt.Scale(domain=['Buy', 'Closed', 'Tax Liquidation'], range=['#00b050', '#ff0000', '#FFA500']), legend=None),
+                            color=alt.Color('Action:N', scale=alt.Scale(domain=['Buy', 'Closed', 'VA Sell', 'Tax Liquidation'], range=['#00b050', '#ff0000', '#FFA500', '#800080']), legend=None),
                             tooltip=[alt.Tooltip('Date:T', format='%Y-%m-%d'), 'Action:N', alt.Tooltip('Stock Price:Q', format=',.2f'), alt.Tooltip('Value:Q', format=',.2f')]
                         )
                         final_chart = alt.layer(chart, markers).resolve_scale(color='independent').properties(height=400).interactive()
@@ -819,7 +957,7 @@ try:
             opt_col1, opt_col2 = st.columns(2)
             with opt_col1:
                 optimize_target = st.selectbox("Parameter to Optimize", 
-                                             ["Trailing Stop %", "Activation Target %", "Buy Drop %", "SMA Short", "RSI Buy", "Trend SMA", "Confirmation Days"])
+                                             ["Trailing Stop %", "Activation Target %", "Buy Drop %", "SMA Short", "RSI Buy", "Trend SMA", "Confirmation Days", "BB Window", "BB Std Dev"])
             with opt_col2:
                 st.write("Range Settings")
                 r_start = st.number_input("Start", value=1.0, step=0.5)
@@ -829,14 +967,6 @@ try:
             if st.button("Run Optimization Sweep"):
                 if r_step <= 0:
                     st.error("Step size must be greater than 0.")
-                elif strategy_mode == "SMA Crossover" and optimize_target not in ["SMA Short"]:
-                     st.error("For SMA Crossover, you can only optimize 'SMA Short' in this demo.")
-                elif strategy_mode == "RSI Mean Reversion" and optimize_target not in ["RSI Buy"]:
-                     st.error("For RSI, you can only optimize 'RSI Buy' in this demo.")
-                elif strategy_mode == "Trend-Filtered Dip" and optimize_target not in ["Buy Drop %", "Trend SMA", "Confirmation Days"]:
-                     st.error("Select a relevant parameter for Trend-Filtered Dip.")
-                elif strategy_mode in ["Swing Trading"] and optimize_target in ["SMA Short", "RSI Buy", "Trend SMA", "Confirmation Days"]:
-                     st.error("Select a relevant parameter for Swing Trading.")
                 else:
                     results_sweep = []
                     test_values = np.arange(r_start, r_end + 0.001, r_step)
@@ -846,21 +976,15 @@ try:
                     
                     for idx, val in enumerate(test_values):
                         temp_params = current_params.copy()
-                        if optimize_target == "Trailing Stop %":
-                            temp_params['use_trailing_stop'] = True
-                            temp_params['trailing_stop_pct'] = val
-                        elif optimize_target == "Activation Target %":
-                            temp_params['sell_profit_pct'] = val
-                        elif optimize_target == "Buy Drop %":
-                            temp_params['buy_drop_pct'] = val
-                        elif optimize_target == "SMA Short":
-                            temp_params['sma_short'] = int(val)
-                        elif optimize_target == "RSI Buy":
-                            temp_params['rsi_buy'] = int(val)
-                        elif optimize_target == "Trend SMA":
-                            temp_params['trend_sma'] = int(val)
-                        elif optimize_target == "Confirmation Days":
-                            temp_params['confirmation_days'] = int(val)
+                        if optimize_target == "Trailing Stop %": temp_params['use_trailing_stop'] = True; temp_params['trailing_stop_pct'] = val
+                        elif optimize_target == "Activation Target %": temp_params['sell_profit_pct'] = val
+                        elif optimize_target == "Buy Drop %": temp_params['buy_drop_pct'] = val
+                        elif optimize_target == "SMA Short": temp_params['sma_short'] = int(val)
+                        elif optimize_target == "RSI Buy": temp_params['rsi_buy'] = int(val)
+                        elif optimize_target == "Trend SMA": temp_params['trend_sma'] = int(val)
+                        elif optimize_target == "Confirmation Days": temp_params['confirmation_days'] = int(val)
+                        elif optimize_target == "BB Window": temp_params['bb_window'] = int(val)
+                        elif optimize_target == "BB Std Dev": temp_params['bb_std'] = val
                         
                         res = run_simulation(df, temp_params)
                         results_sweep.append({
