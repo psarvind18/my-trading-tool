@@ -73,7 +73,7 @@ try:
             loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
             rs = gain / loss
             df['RSI'] = 100 - (100 / (1 + rs))
-        elif params['strategy_mode'] == "Trend-Filtered Dip":
+        elif params['strategy_mode'] in ["Trend-Filtered Dip", "Trend-Filtered B&H"]:
             df['SMA_Trend'] = df['Close'].rolling(window=params['trend_sma']).mean()
         elif params['strategy_mode'] == "Bollinger Bands":
             df['BB_SMA'] = df['Close'].rolling(window=params['bb_window']).mean()
@@ -124,7 +124,7 @@ try:
         potential_trades = []
         trades_by_date = {} 
         
-        # --- 1. GENERATE DAILY SIGNALS ---
+        # --- 1. GENERATE DAILY SIGNALS (For lot-based strategies) ---
         for i in range(1, len(df)):
             daily_date = df.loc[i, 'Date']
             if daily_date not in trades_by_date:
@@ -307,7 +307,6 @@ try:
 
             elif strategy_mode == "Bollinger Bands":
                 if pd.notnull(df.loc[i-1, 'BB_Lower']):
-                    # Buy when price drops below yesterday's Lower Band
                     if df.loc[i, 'Low'] <= df.loc[i-1, 'BB_Lower']:
                         buy_price = df.loc[i-1, 'BB_Lower']
                         sell_date = pd.NaT
@@ -315,7 +314,6 @@ try:
                         status = "Open"
                         for j in range(i + 1, len(df)):
                             if pd.notnull(df.loc[j-1, 'BB_Upper']):
-                                # Sell when price jumps above yesterday's Upper Band
                                 if df.loc[j, 'High'] >= df.loc[j-1, 'BB_Upper']:
                                     sell_date = df.loc[j, 'Date']
                                     sell_price = df.loc[j-1, 'BB_Upper']
@@ -368,14 +366,15 @@ try:
         last_month_processed = -1
         months_passed = 0
         
-        # Value Averaging Initialization (Day 1)
-        if strategy_mode == "Value Averaging":
+        # Initialization for Portfolio-Level Strategies
+        current_regime = "Bull"
+        if strategy_mode == "Trend-Filtered B&H" or strategy_mode == "Value Averaging":
             qty = initial_investment / first_open_price
             wallet -= initial_investment
             current_total_shares += qty
             t_obj = {
                 "trade_id": 0, "buy_date": df.iloc[0]['Date'],
-                "buy_price": first_open_price, "drop_pct": "VA Init",
+                "buy_price": first_open_price, "drop_pct": "Initial Buy",
                 "sell_date": pd.NaT, "sell_price": 0.0,
                 "status": "Open", "quantity": qty
             }
@@ -383,7 +382,6 @@ try:
             trade_decisions[0] = "Executed"
             active_holdings.add(0)
             executed_count += 1
-            # Note: portfolio_cash_flows already logged -initial_investment
         
         for i in range(len(df)):
             curr_date = df.iloc[i]['Date']
@@ -444,11 +442,70 @@ try:
                             total_taxes_paid += tax_bill
                             tax_events_log.append({"Date": curr_date, "Year Taxed": prev_year, "Amount": tax_bill})
             
+            # --- TREND-FILTERED B&H: DAILY REGIME CHECK ---
+            is_new_month = (curr_date.month != last_month_processed)
+            
+            if strategy_mode == "Trend-Filtered B&H":
+                sma_trend = df.iloc[i]['SMA_Trend']
+                if pd.notnull(sma_trend):
+                    if current_regime == "Bull" and curr_close < sma_trend:
+                        current_regime = "Bear"
+                        # Sell all to cash
+                        if current_total_shares > 0:
+                            revenue = current_total_shares * curr_close
+                            wallet += revenue
+                            trade_cash_flows.append((curr_date, revenue))
+                            
+                            for t_id in list(active_holdings):
+                                t_obj = potential_trades[t_id]
+                                t_obj['sell_date'] = curr_date
+                                t_obj['sell_price'] = curr_close
+                                t_obj['status'] = "Closed"
+                                
+                                if enable_taxes:
+                                    profit = (curr_close - t_obj['buy_price']) * t_obj['quantity']
+                                    days_held = (curr_date - t_obj['buy_date']).days
+                                    c_year = curr_date.year
+                                    if c_year not in yearly_realized_gains: yearly_realized_gains[c_year] = {'st': 0.0, 'lt': 0.0}
+                                    if days_held > 365: yearly_realized_gains[c_year]['lt'] += profit
+                                    else: yearly_realized_gains[c_year]['st'] += profit
+                            
+                            active_holdings.clear()
+                            current_total_shares = 0.0
+
+                    elif current_regime == "Bear":
+                        is_healthy = True
+                        for k in range(confirmation_days):
+                            if (i-k) < 0 or pd.isnull(df.iloc[i-k]['SMA_Trend']) or df.iloc[i-k]['Close'] <= df.iloc[i-k]['SMA_Trend']:
+                                is_healthy = False
+                                break
+                        
+                        if is_healthy:
+                            current_regime = "Bull"
+                            # Reinvest ALL hoarded cash
+                            if wallet > 0:
+                                qty = wallet / curr_close
+                                spend = wallet
+                                wallet = 0.0
+                                current_total_shares += qty
+                                trade_cash_flows.append((curr_date, -spend))
+                                
+                                t_obj = {
+                                    "trade_id": len(potential_trades), "buy_date": curr_date,
+                                    "buy_price": curr_close, "drop_pct": "Bull Re-entry",
+                                    "sell_date": pd.NaT, "sell_price": 0.0,
+                                    "status": "Open", "quantity": qty
+                                }
+                                potential_trades.append(t_obj)
+                                trade_decisions[t_obj['trade_id']] = "Executed"
+                                active_holdings.add(t_obj['trade_id'])
+                                executed_count += 1
+
             # --- MONTHLY ACTIONS ---
-            if curr_date.month != last_month_processed:
+            if is_new_month:
                 if i > 0: months_passed += 1
                 
-                # Standard Contribution
+                # Standard Contribution addition
                 if monthly_investment > 0 and i > 0:
                     wallet += monthly_investment
                     portfolio_cash_flows.append((curr_date, -monthly_investment))
@@ -467,7 +524,6 @@ try:
                     diff = target_value - current_holdings_val
                     
                     if diff > 0:
-                        # Buy Shares to catch up
                         spend = min(diff, wallet)
                         if spend > 0:
                             qty = spend / curr_close
@@ -485,7 +541,6 @@ try:
                             executed_count += 1
                             trade_cash_flows.append((curr_date, -spend))
                     elif diff < 0:
-                        # Sell Shares to lock in excess profit
                         target_revenue = min(abs(diff), current_holdings_val)
                         revenue_collected = 0.0
                         
@@ -496,7 +551,6 @@ try:
                             pos_value = t['quantity'] * curr_close
                             
                             if pos_value <= (target_revenue - revenue_collected):
-                                # Liquidate entire lot
                                 wallet += pos_value
                                 revenue_collected += pos_value
                                 current_total_shares -= t['quantity']
@@ -514,7 +568,6 @@ try:
                                     if days_held > 365: yearly_realized_gains[c_year]['lt'] += profit
                                     else: yearly_realized_gains[c_year]['st'] += profit
                             else:
-                                # Liquidate partial lot
                                 needed_revenue = target_revenue - revenue_collected
                                 qty_to_sell = needed_revenue / curr_close
                                 
@@ -523,7 +576,6 @@ try:
                                 current_total_shares -= qty_to_sell
                                 t['quantity'] -= qty_to_sell
                                 
-                                # Log the partial sell for tracking
                                 sold_obj = {
                                     "trade_id": len(potential_trades), "buy_date": t['buy_date'],
                                     "buy_price": t['buy_price'], "drop_pct": "VA Sell",
@@ -542,6 +594,48 @@ try:
                                     if days_held > 365: yearly_realized_gains[c_year]['lt'] += profit
                                     else: yearly_realized_gains[c_year]['st'] += profit
                                 break
+                
+                # Trend-Filtered B&H Specific Monthly Execution
+                if strategy_mode == "Trend-Filtered B&H" and i > 0 and monthly_investment > 0:
+                    if current_regime == "Bull":
+                        # Buy with everything in the wallet
+                        if wallet > 0:
+                            qty = wallet / curr_close
+                            spend = wallet
+                            wallet = 0.0
+                            current_total_shares += qty
+                            trade_cash_flows.append((curr_date, -spend))
+                            
+                            t_obj = {
+                                "trade_id": len(potential_trades), "buy_date": curr_date,
+                                "buy_price": curr_close, "drop_pct": "Bull DCA",
+                                "sell_date": pd.NaT, "sell_price": 0.0,
+                                "status": "Open", "quantity": qty
+                            }
+                            potential_trades.append(t_obj)
+                            trade_decisions[t_obj['trade_id']] = "Executed"
+                            active_holdings.add(t_obj['trade_id'])
+                            executed_count += 1
+                            
+                    elif current_regime == "Bear":
+                        # ONLY buy the monthly amount
+                        spend = min(monthly_investment, wallet)
+                        if spend > 0:
+                            qty = spend / curr_close
+                            wallet -= spend
+                            current_total_shares += qty
+                            trade_cash_flows.append((curr_date, -spend))
+                            
+                            t_obj = {
+                                "trade_id": len(potential_trades), "buy_date": curr_date,
+                                "buy_price": curr_close, "drop_pct": "Bear DCA",
+                                "sell_date": pd.NaT, "sell_price": 0.0,
+                                "status": "Open", "quantity": qty
+                            }
+                            potential_trades.append(t_obj)
+                            trade_decisions[t_obj['trade_id']] = "Executed"
+                            active_holdings.add(t_obj['trade_id'])
+                            executed_count += 1
                             
                 last_month_processed = curr_date.month
 
@@ -568,8 +662,8 @@ try:
                         bh_payout = bh_shares * today_div_amount
                         bh_wallet += bh_payout
 
-            # Trading Execution (For non-VA signal-based strategies)
-            if strategy_mode != "Value Averaging" and curr_date in trades_by_date:
+            # Trading Execution (For non-portfolio level strategies)
+            if strategy_mode not in ["Value Averaging", "Trend-Filtered B&H"] and curr_date in trades_by_date:
                 day_activity = trades_by_date[curr_date]
                 
                 for t in day_activity['sells']:
@@ -714,7 +808,7 @@ try:
         
         st.header("2. Strategy Settings")
         strategy_mode = st.selectbox("Strategy Type", [
-            "Value Averaging", "Bollinger Bands", "Swing Trading", 
+            "Trend-Filtered B&H", "Value Averaging", "Bollinger Bands", "Swing Trading", 
             "Trend-Filtered Dip", "Dip Accumulation", "SMA Crossover", "RSI Mean Reversion"
         ])
         
@@ -731,19 +825,28 @@ try:
         bb_window = 50
         bb_std = 2.0
 
-        if strategy_mode in ["Swing Trading", "Dip Accumulation", "Trend-Filtered Dip"]:
-            buy_drop_pct = st.number_input("Buy Drop Step (%)", value=1.0, step=0.1)
+        if strategy_mode in ["Swing Trading", "Dip Accumulation", "Trend-Filtered Dip", "Trend-Filtered B&H"]:
             
-            if strategy_mode == "Trend-Filtered Dip":
+            if strategy_mode == "Trend-Filtered B&H":
+                st.info("Acts like Buy & Hold during uptrends. Sells to cash when trend breaks, but continues standard Monthly DCA during the bear market. Reinvests all hoarded cash when uptrend resumes.")
+                trend_sma = st.number_input("Trend Filter (SMA Days)", value=200, step=10)
+                confirmation_days = st.number_input("Confirmation (Days above SMA)", value=3, step=1)
+                
+            elif strategy_mode == "Trend-Filtered Dip":
                 st.info("Buys dips ONLY when price is in a confirmed uptrend. Sells everything when trend breaks.")
+                buy_drop_pct = st.number_input("Buy Drop Step (%)", value=1.0, step=0.1)
                 trend_sma = st.number_input("Trend Filter (SMA Days)", value=200, step=10)
                 confirmation_days = st.number_input("Confirmation (Days above SMA)", value=3, step=1)
                 
             elif strategy_mode == "Swing Trading":
+                buy_drop_pct = st.number_input("Buy Drop Step (%)", value=1.0, step=0.1)
                 sell_profit_pct = st.number_input("Activation Target (%)", value=4.0, step=0.1)
                 use_trailing_stop = st.checkbox("Enable Trailing Stop", value=True)
                 if use_trailing_stop:
                     trailing_stop_pct = st.number_input("Trailing Stop (%) (Base Value)", value=2.0, step=0.1)
+                    
+            elif strategy_mode == "Dip Accumulation":
+                buy_drop_pct = st.number_input("Buy Drop Step (%)", value=1.0, step=0.1)
         
         elif strategy_mode == "Value Averaging":
             st.info("Dynamically buys and sells shares to force the portfolio value to increase by exactly your 'Monthly Contribution' amount every month.")
