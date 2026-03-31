@@ -520,4 +520,258 @@ try:
         elif strategy_mode == "SMA Crossover":
             st.info("Buys when Short SMA crosses ABOVE Long SMA. Sells when Short crosses BELOW.")
             sma_short = st.number_input("Short SMA (Days)", value=50, step=5)
-            sma_long = st.number_input("Long SMA (Days)", value=200
+            sma_long = st.number_input("Long SMA (Days)", value=200, step=5)
+
+        elif strategy_mode == "RSI Mean Reversion":
+            st.info("Buys when RSI < Buy Level. Sells when RSI > Sell Level.")
+            rsi_buy = st.number_input("RSI Buy Level (Oversold)", value=30, step=5)
+            rsi_sell = st.number_input("RSI Sell Level (Overbought)", value=70, step=5)
+
+        st.divider()
+        st.header("3. Baseline Comparison")
+        st.info("Dip Accumulation is always calculated as a baseline.")
+        baseline_buy_drop_pct = st.number_input("Baseline Buy Drop (%)", value=1.0, step=0.1)
+
+        st.divider()
+        st.header("4. Financials")
+        interest_rate_pct = st.number_input("Cash Interest (%)", value=3.75, step=0.25, format="%.2f")
+        enable_dividends = st.checkbox("Include Dividends", True)
+        restrict_ex_date = st.checkbox("Restrict Ex-Date", True) if enable_dividends else False
+        
+        st.divider()
+        st.header("5. Wallet & Sizing")
+        currency_symbol = st.text_input("Currency", "$")
+        initial_investment = st.number_input("Initial Inv.", value=1000.0, step=500.0)
+        monthly_investment = st.number_input("Monthly Contrib.", value=0.0, step=100.0)
+        
+        trade_size_type = st.selectbox("Trade Size Type", ["Fixed Shares", "Dollar Amount"])
+        shares_per_trade = 1
+        min_trade_amt = 0.0
+        max_trade_amt = 0.0
+        
+        if trade_size_type == "Fixed Shares":
+            shares_per_trade = st.number_input("Shares per Trade", value=1, step=1)
+        else:
+            c1, c2 = st.columns(2)
+            min_trade_amt = c1.number_input("Min Trade $", value=100.0, step=50.0)
+            max_trade_amt = c2.number_input("Max Trade $", value=1000.0, step=50.0)
+
+    tab1, tab2 = st.tabs(["📊 Single Backtest", "🚀 Optimizer (Parameter Sweep)"])
+
+    if st.session_state['stock_data'] is not None:
+        df = st.session_state['stock_data']
+        
+        current_params = {
+            'strategy_mode': strategy_mode,
+            'buy_drop_pct': buy_drop_pct,
+            'sell_profit_pct': sell_profit_pct,
+            'use_trailing_stop': use_trailing_stop,
+            'trailing_stop_pct': trailing_stop_pct,
+            'sma_short': sma_short,
+            'sma_long': sma_long,
+            'rsi_buy': rsi_buy,
+            'rsi_sell': rsi_sell,
+            'trend_sma': trend_sma,
+            'confirmation_days': confirmation_days,
+            'interest_rate_pct': interest_rate_pct,
+            'enable_dividends': enable_dividends,
+            'restrict_ex_date': restrict_ex_date,
+            'initial_investment': initial_investment,
+            'monthly_investment': monthly_investment,
+            'trade_size_type': trade_size_type,
+            'shares_per_trade': shares_per_trade,
+            'min_trade_amt': min_trade_amt,
+            'max_trade_amt': max_trade_amt
+        }
+
+        with tab1:
+            if st.button("Run Single Backtest"):
+                res = run_simulation(df, current_params)
+                st.session_state['sim_results'] = res
+                
+                baseline_params = current_params.copy()
+                baseline_params['strategy_mode'] = "Dip Accumulation"
+                baseline_params['buy_drop_pct'] = baseline_buy_drop_pct
+                res_base = run_simulation(df, baseline_params)
+                st.session_state['baseline_results'] = res_base
+            
+            if st.session_state['sim_results'] is not None and st.session_state['baseline_results'] is not None:
+                res = st.session_state['sim_results']
+                res_base = st.session_state['baseline_results']
+                
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Final Value", f"{currency_symbol}{res['final_value']:,.2f}", delta=f"Inv: {currency_symbol}{res['invested_capital']:,.0f}")
+                c2.metric("Selected Strategy XIRR", f"{res['strategy_xirr']:.2%}")
+                c3.metric("Baseline Dip XIRR", f"{res_base['strategy_xirr']:.2%}")
+                c4.metric("Buy & Hold XIRR", f"{res['bh_xirr']:.2%}")
+                c5.metric("Trade Efficiency", f"{res['trade_xirr']:.2%}")
+                
+                c6, c7, c8, c9 = st.columns(4)
+                c6.metric("Trades", f"{res['executed_trades']} / {res['executed_trades'] + res['missed_trades']}")
+                c7.metric("Passive Income", f"{currency_symbol}{res['passive_income']:,.2f}")
+                c8.metric("Cash Balance", f"{currency_symbol}{res['wallet_cash']:,.2f}")
+                c9.metric("Open Value", f"{currency_symbol}{res['open_value']:,.2f}")
+
+                if enable_dividends and res['dividend_events']:
+                    with st.expander(f"📅 Dividend Schedule ({len(res['dividend_events'])})"):
+                        st.dataframe(pd.DataFrame(res['dividend_events']))
+                
+                st.subheader("Trade Log")
+                logs = []
+                last_close = df.iloc[-1]['Close']
+                for t in res['trades']:
+                    decision = res['decisions'].get(t['trade_id'], "Missed")
+                    p_share = 0.0
+                    s_price = 0.0
+                    qty = t['quantity']
+                    
+                    if decision == "Executed":
+                        s_price = t['sell_price'] if t['status'] == "Closed" else last_close
+                        p_share = s_price - t['buy_price']
+                    
+                    logs.append({
+                        "Date": t['buy_date'].strftime('%Y-%m-%d'),
+                        "Buy": f"{currency_symbol}{t['buy_price']:.2f}",
+                        "Sell": f"{currency_symbol}{s_price:.2f}" if decision == "Executed" else "-",
+                        "Qty": f"{qty:.4f}" if decision == "Executed" else "-",
+                        "Profit": f"{currency_symbol}{p_share * qty:.2f}" if decision == "Executed" else "-",
+                        "Status": t['status'],
+                        "Drop/Signal": t['drop_pct']
+                    })
+                st.dataframe(pd.DataFrame(logs), use_container_width=True)
+                
+                st.subheader("📈 Portfolio Growth Over Time")
+                
+                hist_df = pd.DataFrame(res['daily_history'])
+                hist_df.rename(columns={"Total Value": "Selected Strategy"}, inplace=True)
+                
+                base_df = pd.DataFrame(res_base['daily_history'])[['Date', 'Total Value']]
+                base_df.rename(columns={"Total Value": "Baseline (Dip Accum.)"}, inplace=True)
+                
+                chart_df = pd.merge(hist_df, base_df, on="Date")
+                
+                all_metrics = ['Selected Strategy', 'Baseline (Dip Accum.)', 'Buy & Hold', 'Cash', 'Open Positions']
+                chart_data_melted = chart_df.melt(id_vars='Date', value_vars=all_metrics, 
+                                        var_name='Metric', value_name='Value')
+                
+                selected_metrics = st.multiselect("Select Metrics:", options=all_metrics, default=all_metrics[:3])
+                
+                if selected_metrics:
+                    filtered_chart_df = chart_data_melted[chart_data_melted['Metric'].isin(selected_metrics)]
+                    chart = alt.Chart(filtered_chart_df).mark_line().encode(
+                        x='Date:T',
+                        y=alt.Y('Value:Q', title=f'Value ({currency_symbol})'),
+                        color='Metric:N',
+                        tooltip=['Date', 'Metric', 'Value']
+                    )
+                    
+                    marker_data = []
+                    val_lookup = hist_df.set_index('Date')['Selected Strategy'].to_dict()
+                    
+                    for t in res['trades']:
+                        if res['decisions'].get(t['trade_id']) == "Executed":
+                            buy_d = t['buy_date']
+                            if buy_d in val_lookup:
+                                marker_data.append({"Date": buy_d, "Action": "Buy", "Value": val_lookup[buy_d], "Stock Price": t['buy_price']})
+                            
+                            if t['status'] == "Closed":
+                                sell_d = t['sell_date']
+                                if pd.notnull(sell_d) and sell_d in val_lookup:
+                                    marker_data.append({"Date": sell_d, "Action": "Sell", "Value": val_lookup[sell_d], "Stock Price": t['sell_price']})
+                    
+                    if marker_data and 'Selected Strategy' in selected_metrics:
+                        markers_df = pd.DataFrame(marker_data)
+                        markers = alt.Chart(markers_df).mark_circle(size=80, opacity=1).encode(
+                            x='Date:T',
+                            y='Value:Q',
+                            color=alt.Color('Action:N', scale=alt.Scale(domain=['Buy', 'Sell'], range=['#00b050', '#ff0000']), legend=None),
+                            tooltip=['Date', 'Action', 'Stock Price', 'Value']
+                        )
+                        final_chart = (chart + markers).properties(height=400).interactive()
+                    else:
+                        final_chart = chart.properties(height=400).interactive()
+                    
+                    st.altair_chart(final_chart, use_container_width=True)
+
+        with tab2:
+            st.write("Automatically test different parameters to find the 'Sweet Spot'.")
+            
+            opt_col1, opt_col2 = st.columns(2)
+            with opt_col1:
+                optimize_target = st.selectbox("Parameter to Optimize", 
+                                             ["Trailing Stop %", "Activation Target %", "Buy Drop %", "SMA Short", "RSI Buy", "Trend SMA", "Confirmation Days"])
+            with opt_col2:
+                st.write("Range Settings")
+                r_start = st.number_input("Start", value=1.0, step=0.5)
+                r_end = st.number_input("End", value=10.0, step=0.5)
+                r_step = st.number_input("Step", value=0.5, step=0.1)
+
+            if st.button("Run Optimization Sweep"):
+                if r_step <= 0:
+                    st.error("Step size must be greater than 0.")
+                elif strategy_mode == "SMA Crossover" and optimize_target not in ["SMA Short"]:
+                     st.error("For SMA Crossover, you can only optimize 'SMA Short' in this demo.")
+                elif strategy_mode == "RSI Mean Reversion" and optimize_target not in ["RSI Buy"]:
+                     st.error("For RSI, you can only optimize 'RSI Buy' in this demo.")
+                elif strategy_mode == "Trend-Filtered Dip" and optimize_target not in ["Buy Drop %", "Trend SMA", "Confirmation Days"]:
+                     st.error("Select a relevant parameter for Trend-Filtered Dip.")
+                elif strategy_mode in ["Swing Trading"] and optimize_target in ["SMA Short", "RSI Buy", "Trend SMA", "Confirmation Days"]:
+                     st.error("Select a relevant parameter for Swing Trading.")
+                else:
+                    results_sweep = []
+                    test_values = np.arange(r_start, r_end + 0.001, r_step)
+                    bar = st.progress(0)
+                    best_xirr = -999.0
+                    best_val = 0.0
+                    
+                    for idx, val in enumerate(test_values):
+                        temp_params = current_params.copy()
+                        if optimize_target == "Trailing Stop %":
+                            temp_params['use_trailing_stop'] = True
+                            temp_params['trailing_stop_pct'] = val
+                        elif optimize_target == "Activation Target %":
+                            temp_params['sell_profit_pct'] = val
+                        elif optimize_target == "Buy Drop %":
+                            temp_params['buy_drop_pct'] = val
+                        elif optimize_target == "SMA Short":
+                            temp_params['sma_short'] = int(val)
+                        elif optimize_target == "RSI Buy":
+                            temp_params['rsi_buy'] = int(val)
+                        elif optimize_target == "Trend SMA":
+                            temp_params['trend_sma'] = int(val)
+                        elif optimize_target == "Confirmation Days":
+                            temp_params['confirmation_days'] = int(val)
+                        
+                        res = run_simulation(df, temp_params)
+                        results_sweep.append({
+                            "Parameter Value": round(val, 2),
+                            "Strategy XIRR": res['strategy_xirr'] * 100.0,
+                            "Profit": res['final_value'] - res['invested_capital']
+                        })
+                        
+                        if res['strategy_xirr'] > best_xirr:
+                            best_xirr = res['strategy_xirr']
+                            best_val = val
+                        bar.progress((idx + 1) / len(test_values))
+                    
+                    bar.empty()
+                    res_df = pd.DataFrame(results_sweep)
+                    
+                    st.success(f"🏆 Best {optimize_target}: **{best_val:.2f}** (XIRR: {best_xirr:.2%})")
+                    
+                    chart = alt.Chart(res_df).mark_line(point=True).encode(
+                        x=alt.X('Parameter Value', title=f'{optimize_target}'),
+                        y=alt.Y('Strategy XIRR', title='Return (XIRR %)'),
+                        tooltip=['Parameter Value', 'Strategy XIRR', 'Profit']
+                    ).interactive()
+                    
+                    st.altair_chart(chart, use_container_width=True)
+                    st.dataframe(res_df.set_index("Parameter Value"))
+
+    else:
+        st.info("👈 Step 1: Load Data to begin.")
+
+except Exception as e:
+    st.error("🚨 **A critical error occurred while building the app.**")
+    st.error(f"Error Details: `{e}`")
+    st.code(traceback.format_exc())
