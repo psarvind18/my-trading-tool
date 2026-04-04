@@ -64,6 +64,9 @@ try:
         df = df_raw.copy()
         
         # --- Pre-calculate Indicators ---
+        # ALWAYS calculate 200 SMA for the charting overlay
+        df['SMA_200'] = df['Close'].rolling(window=200).mean()
+        
         if params['strategy_mode'] == "SMA Crossover":
             df['SMA_S'] = df['Close'].rolling(window=params['sma_short']).mean()
             df['SMA_L'] = df['Close'].rolling(window=params['sma_long']).mean()
@@ -598,7 +601,6 @@ try:
                 # Trend-Filtered B&H Specific Monthly Execution
                 if strategy_mode == "Trend-Filtered B&H" and i > 0 and monthly_investment > 0:
                     if current_regime == "Bull":
-                        # Buy with everything in the wallet
                         if wallet > 0:
                             qty = wallet / curr_close
                             spend = wallet
@@ -618,7 +620,6 @@ try:
                             executed_count += 1
                             
                     elif current_regime == "Bear":
-                        # ONLY buy the monthly amount
                         spend = min(monthly_investment, wallet)
                         if spend > 0:
                             qty = spend / curr_close
@@ -723,12 +724,16 @@ try:
             daily_total_value = wallet + daily_open_value
             daily_bh_value = (bh_shares * curr_close) + bh_wallet
             
+            # --- RECORD DAILY HISTORY (including Stock Price & SMA) ---
+            sma_val = df.loc[i, 'SMA_200']
             daily_history.append({
                 "Date": curr_date,
                 "Total Value": daily_total_value,
                 "Cash": wallet,
                 "Open Positions": daily_open_value,
-                "Buy & Hold": daily_bh_value
+                "Buy & Hold": daily_bh_value,
+                "Stock Price": curr_close,
+                "200 SMA": sma_val if pd.notnull(sma_val) else None
             })
             
             prev_sim_date = curr_date
@@ -998,7 +1003,7 @@ try:
                     })
                 st.dataframe(pd.DataFrame(logs), use_container_width=True)
                 
-                st.subheader("📈 Portfolio Growth Over Time")
+                st.subheader("📈 Pro-Grade Dual Panel Chart")
                 
                 hist_df = pd.DataFrame(res['daily_history'])
                 hist_df.rename(columns={"Total Value": "Selected Strategy"}, inplace=True)
@@ -1009,50 +1014,65 @@ try:
                 chart_df = pd.merge(hist_df, base_df, on="Date")
                 chart_df['Date'] = pd.to_datetime(chart_df['Date'])
                 
-                all_metrics = ['Selected Strategy', 'Baseline (Dip Accum.)', 'Buy & Hold', 'Cash', 'Open Positions']
-                chart_data_melted = chart_df.melt(id_vars='Date', value_vars=all_metrics, var_name='Metric', value_name='Value')
+                # --- TOP PANEL: ASSET PRICE & OVERLAYS ---
+                price_metrics = ['Stock Price', '200 SMA']
+                # Drop rows where 200 SMA hasn't computed yet to avoid plotting issues
+                price_chart_data = chart_df.dropna(subset=['Stock Price'])
+                price_melted = price_chart_data.melt(id_vars='Date', value_vars=price_metrics, var_name='Metric', value_name='Value')
                 
-                selected_metrics = st.multiselect("Select Metrics:", options=all_metrics, default=all_metrics[:3])
+                price_chart = alt.Chart(price_melted).mark_line().encode(
+                    x=alt.X('Date:T', title='', axis=alt.Axis(labels=False, ticks=False)), # Clean top axis
+                    y=alt.Y('Value:Q', title=f'Asset Price ({currency_symbol})', scale=alt.Scale(zero=False)),
+                    color=alt.Color('Metric:N', scale=alt.Scale(domain=price_metrics, range=['#1f77b4', '#ff7f0e']), legend=alt.Legend(title="Price Action")),
+                    tooltip=[alt.Tooltip('Date:T', format='%Y-%m-%d'), 'Metric:N', alt.Tooltip('Value:Q', format=',.2f')]
+                )
+                
+                # Markers (Mapped to the Stock Price instead of the Portfolio Value)
+                marker_data = []
+                val_lookup = hist_df.set_index('Date')['Stock Price'].to_dict()
+                
+                for t in res['trades']:
+                    if res['decisions'].get(t['trade_id']) == "Executed":
+                        buy_d = pd.to_datetime(t['buy_date'])
+                        if buy_d in val_lookup:
+                            marker_data.append({"Date": buy_d, "Action": "Buy", "Value": val_lookup[buy_d], "Execution Price": t['buy_price']})
+                        
+                        if t.get('status') in ["Closed", "VA Sell", "Tax Liquidation"]:
+                            sell_d = pd.to_datetime(t['sell_date'])
+                            if pd.notnull(sell_d) and sell_d in val_lookup:
+                                marker_data.append({"Date": sell_d, "Action": t.get('status'), "Value": val_lookup[sell_d], "Execution Price": t['sell_price']})
+                
+                if marker_data:
+                    markers_df = pd.DataFrame(marker_data)
+                    markers = alt.Chart(markers_df).mark_circle(size=80, opacity=1).encode(
+                        x=alt.X('Date:T'),
+                        y=alt.Y('Value:Q'),
+                        color=alt.Color('Action:N', scale=alt.Scale(domain=['Buy', 'Closed', 'VA Sell', 'Tax Liquidation'], range=['#00b050', '#ff0000', '#FFA500', '#800080']), legend=alt.Legend(title="Algorithm Actions")),
+                        tooltip=[alt.Tooltip('Date:T', format='%Y-%m-%d'), 'Action:N', alt.Tooltip('Execution Price:Q', format=',.2f')]
+                    )
+                    top_chart = alt.layer(price_chart, markers).properties(height=300)
+                else:
+                    top_chart = price_chart.properties(height=300)
+
+                # --- BOTTOM PANEL: PORTFOLIO GROWTH ---
+                all_metrics = ['Selected Strategy', 'Baseline (Dip Accum.)', 'Buy & Hold', 'Cash', 'Open Positions']
+                selected_metrics = st.multiselect("Select Portfolio Metrics:", options=all_metrics, default=['Selected Strategy', 'Buy & Hold'])
                 
                 if selected_metrics:
-                    filtered_chart_df = chart_data_melted[chart_data_melted['Metric'].isin(selected_metrics)]
-                    
-                    chart = alt.Chart(filtered_chart_df).mark_line().encode(
+                    port_melted = chart_df.melt(id_vars='Date', value_vars=selected_metrics, var_name='Metric', value_name='Value')
+                    bottom_chart = alt.Chart(port_melted).mark_line().encode(
                         x=alt.X('Date:T', title='Date'),
-                        y=alt.Y('Value:Q', title=f'Value ({currency_symbol})'),
-                        color=alt.Color('Metric:N', legend=alt.Legend(title="Metrics")),
+                        y=alt.Y('Value:Q', title=f'Portfolio Value ({currency_symbol})'),
+                        color=alt.Color('Metric:N', legend=alt.Legend(title="Portfolio Growth")),
                         tooltip=[alt.Tooltip('Date:T', format='%Y-%m-%d'), 'Metric:N', alt.Tooltip('Value:Q', format=',.2f')]
-                    )
+                    ).properties(height=300)
                     
-                    marker_data = []
-                    val_lookup = hist_df.set_index('Date')['Selected Strategy'].to_dict()
-                    
-                    for t in res['trades']:
-                        if res['decisions'].get(t['trade_id']) == "Executed":
-                            buy_d = pd.to_datetime(t['buy_date'])
-                            if buy_d in val_lookup:
-                                marker_data.append({"Date": buy_d, "Action": "Buy", "Value": val_lookup[buy_d], "Stock Price": t['buy_price']})
-                            
-                            if t.get('status') in ["Closed", "VA Sell", "Tax Liquidation"]:
-                                sell_d = pd.to_datetime(t['sell_date'])
-                                if pd.notnull(sell_d) and sell_d in val_lookup:
-                                    marker_data.append({"Date": sell_d, "Action": t.get('status'), "Value": val_lookup[sell_d], "Stock Price": t['sell_price']})
-                    
-                    if marker_data and 'Selected Strategy' in selected_metrics:
-                        markers_df = pd.DataFrame(marker_data)
-                        markers = alt.Chart(markers_df).mark_circle(size=80, opacity=1).encode(
-                            x=alt.X('Date:T'),
-                            y=alt.Y('Value:Q'),
-                            color=alt.Color('Action:N', scale=alt.Scale(domain=['Buy', 'Closed', 'VA Sell', 'Tax Liquidation'], range=['#00b050', '#ff0000', '#FFA500', '#800080']), legend=None),
-                            tooltip=[alt.Tooltip('Date:T', format='%Y-%m-%d'), 'Action:N', alt.Tooltip('Stock Price:Q', format=',.2f'), alt.Tooltip('Value:Q', format=',.2f')]
-                        )
-                        final_chart = alt.layer(chart, markers).resolve_scale(color='independent').properties(height=400).interactive()
-                    else:
-                        final_chart = chart.properties(height=400).interactive()
-                    
+                    # Combine charts vertically. They share the X axis implicitly.
+                    final_chart = alt.vconcat(top_chart, bottom_chart).resolve_scale(color='independent').interactive()
                     st.altair_chart(final_chart, use_container_width=True)
                 else:
-                    st.warning("Please select at least one metric to display the chart.")
+                    st.altair_chart(top_chart.interactive(), use_container_width=True)
+                    st.warning("Please select at least one metric to display the bottom chart.")
 
         with tab2:
             st.write("Automatically test different parameters to find the 'Sweet Spot'.")
