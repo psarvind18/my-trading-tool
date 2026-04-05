@@ -3,7 +3,7 @@ import pandas as pd
 import yfinance as yf
 import altair as alt
 import numpy as np
-from datetime import date
+from datetime import date, timedelta
 import traceback
 
 # Unlock Altair's row limit so lines don't disappear on multi-year backtests
@@ -61,10 +61,12 @@ try:
         return rate
 
     def run_simulation(df_raw, params):
+        if len(df_raw) == 0:
+            return None
+            
         df = df_raw.copy()
         
         # --- Pre-calculate Indicators ---
-        # ALWAYS calculate 200 SMA for the charting overlay
         df['SMA_200'] = df['Close'].rolling(window=200).mean()
         
         if params['strategy_mode'] == "SMA Crossover":
@@ -485,7 +487,6 @@ try:
                         
                         if is_healthy:
                             current_regime = "Bull"
-                            # Reinvest ALL hoarded cash
                             if wallet > 0:
                                 qty = wallet / curr_close
                                 spend = wallet
@@ -725,7 +726,7 @@ try:
             daily_bh_value = (bh_shares * curr_close) + bh_wallet
             
             # --- RECORD DAILY HISTORY (including Stock Price & SMA) ---
-            sma_val = df.loc[i, 'SMA_200']
+            sma_val = df.loc[i, 'SMA_200'] if 'SMA_200' in df.columns else None
             daily_history.append({
                 "Date": curr_date,
                 "Total Value": daily_total_value,
@@ -786,16 +787,11 @@ try:
         st.session_state['stock_data'] = None
     if 'stock_info' not in st.session_state:
         st.session_state['stock_info'] = {}
-        
-    if 'sim_results' not in st.session_state:
-        st.session_state['sim_results'] = None
-    if 'baseline_results' not in st.session_state:
-        st.session_state['baseline_results'] = None
 
     with st.sidebar:
         st.header("1. Data Loading")
         ticker_symbol = st.text_input("Ticker Symbol", value="VOO").upper()
-        start_input = st.date_input("Start Date", value=date.today().replace(year=date.today().year - 2), min_value=date(1990, 1, 1))
+        start_input = st.date_input("Start Date", value=date.today().replace(year=date.today().year - 5), min_value=date(1990, 1, 1))
         end_input = st.date_input("End Date", value=date.today(), min_value=date(1990, 1, 1))
         
         if st.button("Step 1: Fetch Data"):
@@ -910,7 +906,7 @@ try:
             min_trade_amt = c1.number_input("Min Trade $", value=100.0, step=50.0)
             max_trade_amt = c2.number_input("Max Trade $", value=1000.0, step=50.0)
 
-    tab1, tab2 = st.tabs(["📊 Single Backtest", "🚀 Optimizer (Parameter Sweep)"])
+    tab1, tab2 = st.tabs(["📊 Single Backtest", "🚀 Optimizer & Out-of-Sample Test"])
 
     if st.session_state['stock_data'] is not None:
         df = st.session_state['stock_data']
@@ -954,7 +950,7 @@ try:
                 res_base = run_simulation(df, baseline_params)
                 st.session_state['baseline_results'] = res_base
             
-            if st.session_state['sim_results'] is not None and st.session_state['baseline_results'] is not None:
+            if st.session_state.get('sim_results') is not None and st.session_state.get('baseline_results') is not None:
                 res = st.session_state['sim_results']
                 res_base = st.session_state['baseline_results']
                 
@@ -1016,18 +1012,16 @@ try:
                 
                 # --- TOP PANEL: ASSET PRICE & OVERLAYS ---
                 price_metrics = ['Stock Price', '200 SMA']
-                # Drop rows where 200 SMA hasn't computed yet to avoid plotting issues
                 price_chart_data = chart_df.dropna(subset=['Stock Price'])
                 price_melted = price_chart_data.melt(id_vars='Date', value_vars=price_metrics, var_name='Metric', value_name='Value')
                 
                 price_chart = alt.Chart(price_melted).mark_line().encode(
-                    x=alt.X('Date:T', title='', axis=alt.Axis(labels=False, ticks=False)), # Clean top axis
+                    x=alt.X('Date:T', title='', axis=alt.Axis(labels=False, ticks=False)), 
                     y=alt.Y('Value:Q', title=f'Asset Price ({currency_symbol})', scale=alt.Scale(zero=False)),
                     color=alt.Color('Metric:N', scale=alt.Scale(domain=price_metrics, range=['#1f77b4', '#ff7f0e']), legend=alt.Legend(title="Price Action")),
                     tooltip=[alt.Tooltip('Date:T', format='%Y-%m-%d'), 'Metric:N', alt.Tooltip('Value:Q', format=',.2f')]
                 )
                 
-                # Markers (Mapped to the Stock Price instead of the Portfolio Value)
                 marker_data = []
                 val_lookup = hist_df.set_index('Date')['Stock Price'].to_dict()
                 
@@ -1067,7 +1061,6 @@ try:
                         tooltip=[alt.Tooltip('Date:T', format='%Y-%m-%d'), 'Metric:N', alt.Tooltip('Value:Q', format=',.2f')]
                     ).properties(height=300)
                     
-                    # Combine charts vertically. They share the X axis implicitly.
                     final_chart = alt.vconcat(top_chart, bottom_chart).resolve_scale(color='independent').interactive()
                     st.altair_chart(final_chart, use_container_width=True)
                 else:
@@ -1087,10 +1080,32 @@ try:
                 r_end = st.number_input("End", value=10.0, step=0.5)
                 r_step = st.number_input("Step", value=0.5, step=0.1)
 
+            st.write("---")
+            st.subheader("🧪 Out-of-Sample (OOS) Testing")
+            st.write("Test if your optimized settings actually work on unseen future data.")
+            use_oos = st.checkbox("Enable Train/Test Split", value=False)
+            split_date = None
+            if use_oos:
+                default_split = end_input.replace(year=end_input.year - 2) if end_input.year - start_input.year > 2 else start_input + timedelta(days=365)
+                split_date = st.date_input("Split Date (Train before, Test after)", value=default_split, min_value=start_input, max_value=end_input)
+
             if st.button("Run Optimization Sweep"):
                 if r_step <= 0:
                     st.error("Step size must be greater than 0.")
                 else:
+                    # 1. Prepare Data
+                    train_df = df.copy()
+                    test_df = None
+                    
+                    if use_oos and split_date:
+                        train_df = df[df['Date'].dt.date <= split_date].reset_index(drop=True)
+                        test_df = df[df['Date'].dt.date > split_date].reset_index(drop=True)
+                        if len(train_df) < 50 or len(test_df) < 20:
+                            st.error("Not enough data to perform a Train/Test split. Please adjust the Split Date.")
+                            st.stop()
+                    
+                    st.markdown(f"### ⚙️ Training Phase ({start_input} to {split_date if use_oos else end_input})")
+                    
                     results_sweep = []
                     test_values = np.arange(r_start, r_end + 0.001, r_step)
                     bar = st.progress(0)
@@ -1109,31 +1124,74 @@ try:
                         elif optimize_target == "BB Window": temp_params['bb_window'] = int(val)
                         elif optimize_target == "BB Std Dev": temp_params['bb_std'] = val
                         
-                        res = run_simulation(df, temp_params)
-                        results_sweep.append({
-                            "Parameter Value": round(val, 2),
-                            "Strategy XIRR": res['strategy_xirr'] * 100.0,
-                            "Profit": res['final_value'] - res['invested_capital']
-                        })
-                        
-                        if res['strategy_xirr'] > best_xirr:
-                            best_xirr = res['strategy_xirr']
-                            best_val = val
+                        res = run_simulation(train_df, temp_params)
+                        if res:
+                            results_sweep.append({
+                                "Parameter Value": round(val, 2),
+                                "Strategy XIRR": res['strategy_xirr'] * 100.0,
+                                "Profit": res['final_value'] - res['invested_capital']
+                            })
+                            
+                            if res['strategy_xirr'] > best_xirr:
+                                best_xirr = res['strategy_xirr']
+                                best_val = val
                         bar.progress((idx + 1) / len(test_values))
                     
                     bar.empty()
                     res_df = pd.DataFrame(results_sweep)
                     
-                    st.success(f"🏆 Best {optimize_target}: **{best_val:.2f}** (XIRR: {best_xirr:.2%})")
+                    st.success(f"🏆 Best Historical Parameter Found: **{best_val:.2f}** (Training XIRR: {best_xirr:.2%})")
                     
                     chart = alt.Chart(res_df).mark_line(point=True).encode(
                         x=alt.X('Parameter Value', title=f'{optimize_target}'),
-                        y=alt.Y('Strategy XIRR', title='Return (XIRR %)'),
+                        y=alt.Y('Strategy XIRR', title='Training Return (XIRR %)'),
                         tooltip=['Parameter Value', 'Strategy XIRR', 'Profit']
                     ).interactive()
                     
                     st.altair_chart(chart, use_container_width=True)
-                    st.dataframe(res_df.set_index("Parameter Value"))
+                    
+                    # 2. Out-of-Sample Testing
+                    if use_oos and test_df is not None:
+                        st.markdown("---")
+                        st.markdown(f"### 🔮 Out-of-Sample Test Phase ({split_date} to {end_input})")
+                        st.write(f"Executing the strategy on unseen future data using **{optimize_target} = {best_val:.2f}**.")
+                        
+                        # Run the strategy on Test Data
+                        test_params = current_params.copy()
+                        if optimize_target == "Trailing Stop %": test_params['use_trailing_stop'] = True; test_params['trailing_stop_pct'] = best_val
+                        elif optimize_target == "Activation Target %": test_params['sell_profit_pct'] = best_val
+                        elif optimize_target == "Buy Drop %": test_params['buy_drop_pct'] = best_val
+                        elif optimize_target == "SMA Short": test_params['sma_short'] = int(best_val)
+                        elif optimize_target == "RSI Buy": test_params['rsi_buy'] = int(best_val)
+                        elif optimize_target == "Trend SMA": test_params['trend_sma'] = int(best_val)
+                        elif optimize_target == "Confirmation Days": test_params['confirmation_days'] = int(best_val)
+                        elif optimize_target == "BB Window": test_params['bb_window'] = int(best_val)
+                        elif optimize_target == "BB Std Dev": test_params['bb_std'] = best_val
+                        
+                        test_res = run_simulation(test_df, test_params)
+                        
+                        # Run Buy & Hold Baseline on Test Data
+                        base_test_res = run_simulation(test_df, current_params)
+                        
+                        if test_res and base_test_res:
+                            # Layout the Scorecard
+                            col1, col2, col3 = st.columns(3)
+                            
+                            strat_xirr = test_res['strategy_xirr']
+                            bh_xirr = base_test_res['bh_xirr']
+                            diff = strat_xirr - bh_xirr
+                            
+                            col1.metric("OOS Strategy XIRR", f"{strat_xirr:.2%}", delta=f"{diff * 100:.2f}% vs B&H")
+                            col2.metric("OOS Buy & Hold XIRR", f"{bh_xirr:.2%}")
+                            
+                            if strat_xirr > bh_xirr:
+                                col3.success("✅ Robust Setting: The algorithm successfully outperformed standard holding on unseen data.")
+                            elif strat_xirr > 0:
+                                col3.warning("⚠️ Survived but Underperformed: The strategy made money, but lost to Buy & Hold in the future data.")
+                            else:
+                                col3.error("🚨 Overfit Failure: The strategy lost money on unseen future data. Discard these settings.")
+                                
+                            st.write(f"**Test Period Profit:** {currency_symbol}{test_res['final_value'] - test_res['invested_capital']:,.2f}")
 
     else:
         st.info("👈 Step 1: Load Data to begin.")
